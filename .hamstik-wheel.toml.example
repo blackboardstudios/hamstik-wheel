@@ -1,0 +1,34 @@
+# Hamstik Wheel repository configuration.
+# Copy to .hamstik-wheel.toml and adjust for the repository.
+
+[hamstik]
+# Candidate discovery is scoped to the Organization/Project selected by Hamstik CLI.
+# Epics are excluded by default because Wheel should execute actionable child work.
+statuses = ["todo"]
+item_types = ["task", "bug", "story", "feature"]
+# Optional extra eligibility gate. Example: ["agent-ready"]
+label_names = []
+
+[models]
+# Any model identifier/pattern Pi can resolve is valid.
+implement = "step-3.7-flash"
+review = "glm-5.3-flash"
+
+[validation]
+# Commands run from the repository root. All must pass before completion.
+commands = [
+  "./scripts/do-prechecks.py",
+]
+
+[loop]
+max_items = 10
+max_review_cycles = 3
+
+[git]
+require_clean_start = true
+commit = true
+commit_message = "{key}: {title}"
+
+[comments]
+post_started = true
+post_completed = true
