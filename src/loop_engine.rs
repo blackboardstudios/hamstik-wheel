@@ -1,7 +1,11 @@
 // Copyright 2026 Blackboard Studios LLC
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
 
 use anyhow::{bail, Context, Result};
 
@@ -9,6 +13,7 @@ use crate::{
     config::Config,
     git::GitRepo,
     hamstik::{select_next, HamstikCli},
+    logging::Logger,
     pi::{implementation_prompt, review_prompt, PiRunner},
     state::{ActiveWorkItem, Phase, StateStore, WheelState},
     validation::run_all,
@@ -21,87 +26,143 @@ pub struct LoopEngine {
     pi: PiRunner,
     store: StateStore,
     logs_root: PathBuf,
+    logger: Logger,
 }
 
 impl LoopEngine {
-    pub fn load() -> Result<Self> {
+    pub fn load_with_logger(logger: &Logger) -> Result<Self> {
         let repo = GitRepo::discover()?;
         let config = Config::load(repo.root())?;
         let hamstik = HamstikCli::new(repo.root(), &config.hamstik.cli_path);
         let pi = PiRunner::new(repo.root());
         let state_path = repo.metadata_path("hamstik-wheel/state.json")?;
         let logs_root = repo.metadata_path("hamstik-wheel/logs")?;
-        Ok(Self { repo, config, hamstik, pi, store: StateStore::new(state_path), logs_root })
+        Ok(Self {
+            repo,
+            config,
+            hamstik,
+            pi,
+            store: StateStore::new(state_path),
+            logs_root,
+            logger: Logger::new(logger.timestamps(), logger.log_file_path().as_deref())?,
+        })
     }
 
     pub fn doctor(&self) -> Result<()> {
         let mut failed = false;
-        println!("Hamstik Wheel Doctor\n");
+        self.logger.info("Hamstik Wheel Doctor");
+        self.logger.blank();
 
-        failed |= !check_process("git", &["--version"]);
-        println!("✓ Git repository: {}", self.repo.root().display());
-        println!("✓ Configuration: {}", Config::path(self.repo.root()).display());
-        failed |= !check_process("pi", &["--version"]);
-        failed |= !check_process(&self.config.hamstik.cli_path, &["--version"]);
+        failed |= !check_process(&self.logger, "git", &["--version"]);
+        self.logger
+            .info(&format!("✓ Git repository: {}", self.repo.root().display()));
+        self.logger.info(&format!(
+            "✓ Configuration: {}",
+            Config::path(self.repo.root()).display()
+        ));
+        failed |= !check_process(&self.logger, "pi", &["--version"]);
+        failed |= !check_process(&self.logger, &self.config.hamstik.cli_path, &["--version"]);
 
         match self.hamstik.verify_required_commands() {
-            Ok(()) => println!("✓ Hamstik CLI command manifest supports Wheel requirements"),
-            Err(e) => { eprintln!("✗ Hamstik CLI command surface: {e:#}"); failed = true; }
+            Ok(()) => self
+                .logger
+                .info("✓ Hamstik CLI command manifest supports Wheel requirements"),
+            Err(e) => {
+                self.logger
+                    .error(&format!("✗ Hamstik CLI command surface: {e:#}"));
+                failed = true;
+            }
         }
         match self.hamstik.doctor() {
-            Ok(_) => println!("✓ Hamstik CLI doctor"),
-            Err(e) => { eprintln!("✗ Hamstik CLI doctor: {e:#}"); failed = true; }
+            Ok(_) => self.logger.info("✓ Hamstik CLI doctor"),
+            Err(e) => {
+                self.logger.error(&format!("✗ Hamstik CLI doctor: {e:#}"));
+                failed = true;
+            }
         }
 
         let state = self.store.load()?;
         if state.current.is_none() && self.config.git.require_clean_start {
             match self.repo.is_clean() {
-                Ok(true) => println!("✓ Working tree clean"),
-                Ok(false) => { eprintln!("✗ Working tree is dirty and require_clean_start=true"); failed = true; }
-                Err(e) => { eprintln!("✗ Could not inspect working tree: {e:#}"); failed = true; }
+                Ok(true) => self.logger.info("✓ Working tree clean"),
+                Ok(false) => {
+                    self.logger
+                        .error("✗ Working tree is dirty and require_clean_start=true");
+                    failed = true;
+                }
+                Err(e) => {
+                    self.logger
+                        .error(&format!("✗ Could not inspect working tree: {e:#}"));
+                    failed = true;
+                }
             }
         } else if state.current.is_some() {
-            println!("✓ Active Wheel state present; dirty tree allowed for resume");
+            self.logger
+                .info("✓ Active Wheel state present; dirty tree allowed for resume");
         }
 
         if self.config.validation.commands.is_empty() {
-            println!("! No validation commands configured; final gate will rely on review only");
+            self.logger
+                .warn("! No validation commands configured; final gate will rely on review only");
         } else {
-            println!("✓ {} validation command(s) configured", self.config.validation.commands.len());
+            self.logger.info(&format!(
+                "✓ {} validation command(s) configured",
+                self.config.validation.commands.len()
+            ));
         }
 
         if check_pi_model(&self.config.models.implement) {
-            println!("✓ Implementation model available: {}", self.config.models.implement);
+            self.logger.info(&format!(
+                "✓ Implementation model available: {}",
+                self.config.models.implement
+            ));
         } else {
-            eprintln!("✗ Pi could not find implementation model: {}", self.config.models.implement);
+            self.logger.error(&format!(
+                "✗ Pi could not find implementation model: {}",
+                self.config.models.implement
+            ));
             failed = true;
         }
         if check_pi_model(&self.config.models.review) {
-            println!("✓ Review model available: {}", self.config.models.review);
+            self.logger.info(&format!(
+                "✓ Review model available: {}",
+                self.config.models.review
+            ));
         } else {
-            eprintln!("✗ Pi could not find review model: {}", self.config.models.review);
+            self.logger.error(&format!(
+                "✗ Pi could not find review model: {}",
+                self.config.models.review
+            ));
             failed = true;
         }
 
-        if failed { bail!("doctor found one or more blocking problems"); }
-        println!("\nReady.");
+        if failed {
+            bail!("doctor found one or more blocking problems");
+        }
+        self.logger.blank();
+        self.logger.info("Ready.");
         Ok(())
     }
 
     pub fn status(&self) -> Result<()> {
         let state = self.store.load()?;
-        println!("State file: {}", self.store.path().display());
-        println!("Logs: {}", self.logs_root.display());
-        println!("Phase: {:?}", state.phase);
+        self.logger
+            .info(&format!("State file: {}", self.store.path().display()));
+        self.logger
+            .info(&format!("Logs: {}", self.logs_root.display()));
+        self.logger.info(&format!("Phase: {:?}", state.phase));
         if let Some(item) = state.current.as_ref() {
-            println!("Work Item: {} — {}", item.key, item.title);
-            println!("Baseline: {}", item.baseline_sha);
-            println!("Review cycle: {}", state.review_cycle);
+            self.logger
+                .info(&format!("Work Item: {} — {}", item.key, item.title));
+            self.logger
+                .info(&format!("Baseline: {}", item.baseline_sha));
+            self.logger
+                .info(&format!("Review cycle: {}", state.review_cycle));
         } else {
-            println!("Work Item: none");
+            self.logger.info("Work Item: none");
         }
         if let Some(error) = state.last_error.as_ref() {
-            println!("Last error: {error}");
+            self.logger.info(&format!("Last error: {error}"));
         }
         Ok(())
     }
@@ -109,17 +170,22 @@ impl LoopEngine {
     pub fn run(&self, max_items: Option<usize>) -> Result<()> {
         self.preflight()?;
         let limit = max_items.unwrap_or(self.config.r#loop.max_items);
-        if limit == 0 { bail!("max-items must be greater than zero"); }
+        if limit == 0 {
+            bail!("max-items must be greater than zero");
+        }
 
         let mut completed = 0usize;
         while completed < limit {
             match self.process_one()? {
                 ProcessOutcome::Completed => {
                     completed += 1;
-                    println!("\nCompleted {completed}/{limit} Work Item(s).\n");
+                    self.logger.blank();
+                    self.logger
+                        .info(&format!("Completed {completed}/{limit} Work Item(s)."));
+                    self.logger.blank();
                 }
                 ProcessOutcome::NoWork => {
-                    println!("No eligible Hamstik Work Items found.");
+                    self.logger.info("No eligible Hamstik Work Items found.");
                     break;
                 }
             }
@@ -131,7 +197,10 @@ impl LoopEngine {
         self.preflight()?;
         match self.process_one()? {
             ProcessOutcome::Completed => Ok(()),
-            ProcessOutcome::NoWork => { println!("No eligible Hamstik Work Items found."); Ok(()) }
+            ProcessOutcome::NoWork => {
+                self.logger.info("No eligible Hamstik Work Items found.");
+                Ok(())
+            }
         }
     }
 
@@ -143,17 +212,28 @@ impl LoopEngine {
         self.once()
     }
 
-
     fn preflight(&self) -> Result<()> {
         require_process("pi", &["--version"])?;
         require_process(&self.config.hamstik.cli_path, &["--version"])?;
         self.hamstik.verify_required_commands()?;
         self.hamstik.doctor()?;
         if !check_pi_model(&self.config.models.implement) {
-            bail!("Pi could not resolve implementation model `{}`", self.config.models.implement);
+            bail!(
+                "Pi could not resolve implementation model `{}`",
+                self.config.models.implement
+            );
         }
         if !check_pi_model(&self.config.models.review) {
-            bail!("Pi could not resolve review model `{}`", self.config.models.review);
+            bail!(
+                "Pi could not resolve review model `{}`",
+                self.config.models.review
+            );
+        }
+        if !pi_supports_json_mode() {
+            bail!(
+                "Pi does not support `--mode json`; activity streaming requires it. \
+                 Update Pi to a version with JSON output mode."
+            );
         }
         Ok(())
     }
@@ -170,9 +250,12 @@ impl LoopEngine {
                 &self.config.hamstik.item_types,
                 &self.config.hamstik.label_names,
             )?;
-            let Some(item) = select_next(candidates) else { return Ok(ProcessOutcome::NoWork); };
+            let Some(item) = select_next(candidates) else {
+                return Ok(ProcessOutcome::NoWork);
+            };
             let baseline = self.repo.head()?;
-            println!("Selected {} — {}", item.key, item.title);
+            self.logger
+                .info(&format!("Selected {} — {}", item.key, item.title));
             state.current = Some(ActiveWorkItem {
                 key: item.key,
                 title: item.title,
@@ -195,7 +278,10 @@ impl LoopEngine {
     }
 
     fn process_active(&self, state: &mut WheelState) -> Result<()> {
-        let current = state.current.clone().context("active state is missing current Work Item")?;
+        let current = state
+            .current
+            .clone()
+            .context("active state is missing current Work Item")?;
         if state.phase == Phase::Idle {
             bail!("active Work Item cannot have idle phase");
         }
@@ -205,7 +291,7 @@ impl LoopEngine {
         let context = self.hamstik.context(&current.key)?;
 
         if state.phase == Phase::Selected {
-            println!("[claim] {}", current.key);
+            self.logger.info(&format!("[claim] {}", current.key));
             self.hamstik.start(&current.key)?;
             if self.config.comments.post_started {
                 let body = format!(
@@ -222,9 +308,20 @@ impl LoopEngine {
         if matches!(state.phase, Phase::Claimed | Phase::Implementing) {
             state.phase = Phase::Implementing;
             self.store.save(state)?;
-            println!("\n[implement] {} with {}", current.key, self.config.models.implement);
-            let prompt = implementation_prompt(&current.key, &current.title, &current.baseline_sha, &context);
-            let run = self.pi.run(&self.config.models.implement, &prompt)?;
+            self.logger.blank();
+            self.logger.info(&format!(
+                "[implement] {} with {}",
+                current.key, self.config.models.implement
+            ));
+            let prompt = implementation_prompt(
+                &current.key,
+                &current.title,
+                &current.baseline_sha,
+                &context,
+            );
+            let run = self
+                .pi
+                .run(&self.config.models.implement, &prompt, &self.logger)?;
             self.write_log(&current.key, "implement.log", &run.transcript)?;
             let result = run.result.with_context(|| {
                 format!(
@@ -242,10 +339,18 @@ impl LoopEngine {
             self.store.save(state)?;
         }
 
-        if matches!(state.phase, Phase::PreReviewValidation | Phase::Reviewing | Phase::FinalValidation) {
+        if matches!(
+            state.phase,
+            Phase::PreReviewValidation | Phase::Reviewing | Phase::FinalValidation
+        ) {
             let mut evidence = if state.phase == Phase::PreReviewValidation {
-                println!("\n[validate] pre-review");
-                let report = run_all(self.repo.root(), &self.config.validation.commands)?;
+                self.logger.blank();
+                self.logger.info("[validate] pre-review");
+                let report = run_all(
+                    self.repo.root(),
+                    &self.config.validation.commands,
+                    &self.logger,
+                )?;
                 let evidence = report.evidence();
                 self.write_log(&current.key, "pre-review-validation.log", &evidence)?;
                 evidence
@@ -259,7 +364,11 @@ impl LoopEngine {
                 state.review_cycle = cycle;
                 state.phase = Phase::Reviewing;
                 self.store.save(state)?;
-                println!("\n[review] cycle {cycle}/{} with {}", self.config.r#loop.max_review_cycles, self.config.models.review);
+                self.logger.blank();
+                self.logger.info(&format!(
+                    "[review] cycle {cycle}/{} with {}",
+                    self.config.r#loop.max_review_cycles, self.config.models.review
+                ));
                 let prompt = review_prompt(
                     &current.key,
                     &current.title,
@@ -268,7 +377,9 @@ impl LoopEngine {
                     &evidence,
                     cycle,
                 );
-                let run = self.pi.run(&self.config.models.review, &prompt)?;
+                let run = self
+                    .pi
+                    .run(&self.config.models.review, &prompt, &self.logger)?;
                 let review_log = format!("review-{cycle:02}.log");
                 self.write_log(&current.key, &review_log, &run.transcript)?;
                 let review = run.result.with_context(|| {
@@ -282,20 +393,36 @@ impl LoopEngine {
                     bail!("review blocked: {}", review.summary);
                 }
                 if review.status != "pass" {
-                    evidence = format!("Reviewer returned status {}. Findings:\n{}", review.status, review.findings.join("\n"));
+                    evidence = format!(
+                        "Reviewer returned status {}. Findings:\n{}",
+                        review.status,
+                        review.findings.join("\n")
+                    );
                     continue;
                 }
                 if !review.findings.is_empty() {
-                    evidence = format!("Reviewer claimed PASS but still reported findings:\n{}", review.findings.join("\n"));
+                    evidence = format!(
+                        "Reviewer claimed PASS but still reported findings:\n{}",
+                        review.findings.join("\n")
+                    );
                     continue;
                 }
 
                 state.phase = Phase::FinalValidation;
                 self.store.save(state)?;
-                println!("\n[validate] final cycle {cycle}");
-                let final_report = run_all(self.repo.root(), &self.config.validation.commands)?;
+                self.logger.blank();
+                self.logger.info(&format!("[validate] final cycle {cycle}"));
+                let final_report = run_all(
+                    self.repo.root(),
+                    &self.config.validation.commands,
+                    &self.logger,
+                )?;
                 let final_evidence = final_report.evidence();
-                self.write_log(&current.key, &format!("final-validation-{cycle:02}.log"), &final_evidence)?;
+                self.write_log(
+                    &current.key,
+                    &format!("final-validation-{cycle:02}.log"),
+                    &final_evidence,
+                )?;
                 if final_report.passed {
                     passed = true;
                     break;
@@ -304,7 +431,10 @@ impl LoopEngine {
             }
 
             if !passed {
-                bail!("review/validation did not reach PASS within {} cycle(s)", self.config.r#loop.max_review_cycles);
+                bail!(
+                    "review/validation did not reach PASS within {} cycle(s)",
+                    self.config.r#loop.max_review_cycles
+                );
             }
 
             if self.config.git.commit {
@@ -321,7 +451,11 @@ impl LoopEngine {
         }
 
         if state.phase == Phase::Committing {
-            let commit_sha = if let Some(existing) = state.current.as_ref().and_then(|item| item.commit_sha.clone()) {
+            let commit_sha = if let Some(existing) = state
+                .current
+                .as_ref()
+                .and_then(|item| item.commit_sha.clone())
+            {
                 existing
             } else if self.repo.is_clean()? && self.repo.head()? != current.baseline_sha {
                 // A crash may have occurred immediately after a successful commit and before
@@ -330,8 +464,13 @@ impl LoopEngine {
                 // recovery signal for the Wheel-created commit.
                 self.repo.head()?
             } else {
-                let message = GitRepo::expand_commit_message(&self.config.git.commit_message, &current.key, &current.title);
-                println!("\n[commit] {message}");
+                let message = GitRepo::expand_commit_message(
+                    &self.config.git.commit_message,
+                    &current.key,
+                    &current.title,
+                );
+                self.logger.blank();
+                self.logger.info(&format!("[commit] {message}"));
                 self.repo.commit_all(&message)?
             };
 
@@ -343,7 +482,10 @@ impl LoopEngine {
         }
 
         if state.phase == Phase::Closing {
-            let commit_sha = state.current.as_ref().and_then(|item| item.commit_sha.clone());
+            let commit_sha = state
+                .current
+                .as_ref()
+                .and_then(|item| item.commit_sha.clone());
             if self.config.git.commit && commit_sha.is_none() {
                 bail!("commit-enabled run reached closing phase without a recorded commit SHA");
             }
@@ -359,19 +501,30 @@ impl LoopEngine {
                 let idem = comment_idempotency_key("complete", &current.key, &current.baseline_sha);
                 self.hamstik.add_comment(&current.key, &body, Some(&idem))?;
             }
-            println!("\n[complete] closing {}", current.key);
+            self.logger.blank();
+            self.logger
+                .info(&format!("[complete] closing {}", current.key));
             self.hamstik.close(&current.key)?;
 
             state.completed_this_run += 1;
             self.store.clear_active(state)?;
             match commit_sha.as_deref() {
-                Some(sha) => println!("{} complete at {}", current.key, sha),
-                None => println!("{} complete (changes left uncommitted by configuration)", current.key),
+                Some(sha) => self
+                    .logger
+                    .info(&format!("{} complete at {}", current.key, sha)),
+                None => self.logger.info(&format!(
+                    "{} complete (changes left uncommitted by configuration)",
+                    current.key
+                )),
             }
             return Ok(());
         }
 
-        bail!("unexpected terminal phase {:?} for {}", state.phase, current.key)
+        bail!(
+            "unexpected terminal phase {:?} for {}",
+            state.phase,
+            current.key
+        )
     }
 
     fn log_path(&self, key: &str, name: &str) -> PathBuf {
@@ -387,7 +540,10 @@ impl LoopEngine {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessOutcome { Completed, NoWork }
+enum ProcessOutcome {
+    Completed,
+    NoWork,
+}
 
 fn require_process(name: &str, args: &[&str]) -> Result<()> {
     let output = Command::new(name)
@@ -404,19 +560,30 @@ fn require_process(name: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn check_process(name: &str, args: &[&str]) -> bool {
+fn check_process(logger: &Logger, name: &str, args: &[&str]) -> bool {
     match Command::new(name).args(args).output() {
         Ok(output) if output.status.success() => {
-            let first = String::from_utf8_lossy(&output.stdout).lines().next().unwrap_or_default().to_string();
-            println!("✓ {name}: {}", if first.is_empty() { "available" } else { first.as_str() });
+            let first = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            logger.info(&format!(
+                "✓ {name}: {}",
+                if first.is_empty() {
+                    "available"
+                } else {
+                    first.as_str()
+                }
+            ));
             true
         }
         Ok(output) => {
-            eprintln!("✗ {name}: exited {:?}", output.status.code());
+            logger.error(&format!("✗ {name}: exited {:?}", output.status.code()));
             false
         }
         Err(error) => {
-            eprintln!("✗ {name}: {error}");
+            logger.error(&format!("✗ {name}: {error}"));
             false
         }
     }
@@ -426,10 +593,25 @@ fn check_pi_model(model: &str) -> bool {
     match Command::new("pi").args(["--list-models", model]).output() {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            !stdout.trim().is_empty() && stdout.to_ascii_lowercase().contains(&model.to_ascii_lowercase())
+            !stdout.trim().is_empty()
+                && stdout
+                    .to_ascii_lowercase()
+                    .contains(&model.to_ascii_lowercase())
         }
         _ => false,
     }
+}
+
+/// Check that the installed Pi supports the JSON output mode Wheel uses for
+/// activity streaming and structured marker extraction.
+fn pi_supports_json_mode() -> bool {
+    Command::new("pi")
+        .args(["--mode", "json", "--help"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn completion_comment(
@@ -448,7 +630,16 @@ fn completion_comment(
 }
 
 fn sanitize_component(value: &str) -> String {
-    value.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect()
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn comment_idempotency_key(kind: &str, key: &str, baseline: &str) -> String {

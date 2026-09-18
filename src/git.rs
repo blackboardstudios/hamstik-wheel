@@ -1,7 +1,10 @@
 // Copyright 2026 Blackboard Studios LLC
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{path::{Path, PathBuf}, process::Command};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use anyhow::{bail, Context, Result};
 
@@ -17,7 +20,10 @@ impl GitRepo {
             .output()
             .context("failed to execute git; is it installed?")?;
         if !output.status.success() {
-            bail!("current directory is not inside a Git repository: {}", String::from_utf8_lossy(&output.stderr).trim());
+            bail!(
+                "current directory is not inside a Git repository: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
         let root = PathBuf::from(String::from_utf8(output.stdout)?.trim());
         Ok(Self { root })
@@ -34,7 +40,11 @@ impl GitRepo {
             .output()
             .with_context(|| format!("failed to execute git {}", args.join(" ")))?;
         if !output.status.success() {
-            bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim());
+            bail!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
         Ok(String::from_utf8(output.stdout)?.trim().to_string())
     }
@@ -50,7 +60,11 @@ impl GitRepo {
     pub fn metadata_path(&self, relative: &str) -> Result<PathBuf> {
         let rendered = self.run(&["rev-parse", "--git-path", relative])?;
         let path = PathBuf::from(rendered);
-        Ok(if path.is_absolute() { path } else { self.root.join(path) })
+        Ok(if path.is_absolute() {
+            path
+        } else {
+            self.root.join(path)
+        })
     }
 
     pub fn commit_all(&self, message: &str) -> Result<String> {
@@ -69,7 +83,10 @@ impl GitRepo {
             .output()
             .context("failed to execute git commit")?;
         if !commit.status.success() {
-            bail!("git commit failed: {}", String::from_utf8_lossy(&commit.stderr).trim());
+            bail!(
+                "git commit failed: {}",
+                String::from_utf8_lossy(&commit.stderr).trim()
+            );
         }
         self.head()
     }

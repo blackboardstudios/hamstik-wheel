@@ -1,7 +1,10 @@
 // Copyright 2026 Blackboard Studios LLC
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -63,8 +66,12 @@ pub struct StateStore {
 }
 
 impl StateStore {
-    pub fn new(path: PathBuf) -> Self { Self { path } }
-    pub fn path(&self) -> &Path { &self.path }
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 
     pub fn load(&self) -> Result<WheelState> {
         if !self.path.exists() {
@@ -98,11 +105,13 @@ impl StateStore {
         }
         let tmp = self.path.with_extension("json.tmp");
         let raw = serde_json::to_vec_pretty(state)?;
-        fs::write(&tmp, raw).with_context(|| format!("failed to write temporary state {}", tmp.display()))?;
+        fs::write(&tmp, raw)
+            .with_context(|| format!("failed to write temporary state {}", tmp.display()))?;
         #[cfg(windows)]
         if self.path.exists() {
-            fs::remove_file(&self.path)
-                .with_context(|| format!("failed to replace existing state {}", self.path.display()))?;
+            fs::remove_file(&self.path).with_context(|| {
+                format!("failed to replace existing state {}", self.path.display())
+            })?;
         }
         fs::rename(&tmp, &self.path)
             .with_context(|| format!("failed to replace state {}", self.path.display()))?;
@@ -128,7 +137,12 @@ mod tests {
         let store = StateStore::new(dir.path().join("state.json"));
         let mut state = WheelState {
             phase: Phase::Selected,
-            current: Some(ActiveWorkItem { key: "HAM-1".into(), title: "One".into(), baseline_sha: "abc".into(), commit_sha: None }),
+            current: Some(ActiveWorkItem {
+                key: "HAM-1".into(),
+                title: "One".into(),
+                baseline_sha: "abc".into(),
+                commit_sha: None,
+            }),
             ..WheelState::default()
         };
         store.save(&mut state).unwrap();

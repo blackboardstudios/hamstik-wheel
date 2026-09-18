@@ -1,7 +1,12 @@
 // Copyright 2026 Blackboard Studios LLC
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{cmp::Ordering, io::Write, path::Path, process::{Command, Stdio}};
+use std::{
+    cmp::Ordering,
+    io::Write,
+    path::Path,
+    process::{Command, Stdio},
+};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -24,7 +29,10 @@ pub struct HamstikCli {
 
 impl HamstikCli {
     pub fn new(repo_root: &Path, cli_path: &str) -> Self {
-        Self { repo_root: repo_root.to_path_buf(), cli_path: std::path::PathBuf::from(cli_path) }
+        Self {
+            repo_root: repo_root.to_path_buf(),
+            cli_path: std::path::PathBuf::from(cli_path),
+        }
     }
 
     fn run_json(&self, args: &[&str]) -> Result<Value> {
@@ -32,8 +40,13 @@ impl HamstikCli {
         cmd.current_dir(&self.repo_root)
             .args(["--no-input", "--json"])
             .args(args);
-        let output = cmd.output()
-            .with_context(|| format!("failed to execute {} {}", self.cli_path.display(), args.join(" ")))?;
+        let output = cmd.output().with_context(|| {
+            format!(
+                "failed to execute {} {}",
+                self.cli_path.display(),
+                args.join(" ")
+            )
+        })?;
 
         if !output.status.success() {
             bail!(
@@ -45,8 +58,13 @@ impl HamstikCli {
             );
         }
 
-        serde_json::from_slice(&output.stdout)
-            .with_context(|| format!("{} {} did not return valid JSON", self.cli_path.display(), args.join(" ")))
+        serde_json::from_slice(&output.stdout).with_context(|| {
+            format!(
+                "{} {} did not return valid JSON",
+                self.cli_path.display(),
+                args.join(" ")
+            )
+        })
     }
 
     fn run_json_owned(&self, args: &[String]) -> Result<Value> {
@@ -54,8 +72,13 @@ impl HamstikCli {
         cmd.current_dir(&self.repo_root)
             .args(["--no-input", "--json"])
             .args(args);
-        let output = cmd.output()
-            .with_context(|| format!("failed to execute {} {}", self.cli_path.display(), args.join(" ")))?;
+        let output = cmd.output().with_context(|| {
+            format!(
+                "failed to execute {} {}",
+                self.cli_path.display(),
+                args.join(" ")
+            )
+        })?;
 
         if !output.status.success() {
             bail!(
@@ -67,8 +90,13 @@ impl HamstikCli {
             );
         }
 
-        serde_json::from_slice(&output.stdout)
-            .with_context(|| format!("{} {} did not return valid JSON", self.cli_path.display(), args.join(" ")))
+        serde_json::from_slice(&output.stdout).with_context(|| {
+            format!(
+                "{} {} did not return valid JSON",
+                self.cli_path.display(),
+                args.join(" ")
+            )
+        })
     }
 
     pub fn doctor(&self) -> Result<Value> {
@@ -97,15 +125,21 @@ impl HamstikCli {
             .context("hamstik command manifest is missing commands[]")?;
 
         for required in REQUIRED {
-            let entry = commands.iter().find(|entry| {
-                entry.get("command").and_then(Value::as_str) == Some(*required)
-            });
+            let entry = commands
+                .iter()
+                .find(|entry| entry.get("command").and_then(Value::as_str) == Some(*required));
             let Some(entry) = entry else {
                 bail!("installed hamstik CLI does not provide required command `{required}`");
             };
             let capabilities = entry.get("capabilities").and_then(Value::as_object);
-            let json = capabilities.and_then(|c| c.get("json")).and_then(Value::as_bool).unwrap_or(false);
-            let no_input = capabilities.and_then(|c| c.get("noInput")).and_then(Value::as_bool).unwrap_or(false);
+            let json = capabilities
+                .and_then(|c| c.get("json"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let no_input = capabilities
+                .and_then(|c| c.get("noInput"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             if !json || !no_input {
                 bail!("required command `{required}` does not advertise --json and --no-input capabilities");
             }
@@ -138,7 +172,15 @@ impl HamstikCli {
     }
 
     pub fn context(&self, key: &str) -> Result<Value> {
-        self.run_json(&["work", "context", key, "--comments", "100", "--activity", "25"])
+        self.run_json(&[
+            "work",
+            "context",
+            key,
+            "--comments",
+            "100",
+            "--activity",
+            "25",
+        ])
     }
 
     pub fn start(&self, key: &str) -> Result<Value> {
@@ -149,11 +191,23 @@ impl HamstikCli {
         self.run_json(&["work", "close", key])
     }
 
-    pub fn add_comment(&self, key: &str, body: &str, idempotency_key: Option<&str>) -> Result<Value> {
+    pub fn add_comment(
+        &self,
+        key: &str,
+        body: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<Value> {
         let mut command = Command::new(&self.cli_path);
-        command
-            .current_dir(&self.repo_root)
-            .args(["--no-input", "--json", "work", "comment", "add", key, "--body-file", "-"]);
+        command.current_dir(&self.repo_root).args([
+            "--no-input",
+            "--json",
+            "work",
+            "comment",
+            "add",
+            key,
+            "--body-file",
+            "-",
+        ]);
         if let Some(value) = idempotency_key {
             command.args(["--idempotency-key", value]);
         }
@@ -164,7 +218,11 @@ impl HamstikCli {
             .spawn()
             .context("failed to execute hamstik work comment add")?;
 
-        child.stdin.as_mut().context("failed to open hamstik stdin")?.write_all(body.as_bytes())?;
+        child
+            .stdin
+            .as_mut()
+            .context("failed to open hamstik stdin")?
+            .write_all(body.as_bytes())?;
         drop(child.stdin.take());
         let output = child.wait_with_output()?;
         if !output.status.success() {
@@ -175,7 +233,8 @@ impl HamstikCli {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        serde_json::from_slice(&output.stdout).context("hamstik comment command did not return valid JSON")
+        serde_json::from_slice(&output.stdout)
+            .context("hamstik comment command did not return valid JSON")
     }
 }
 
@@ -224,7 +283,8 @@ fn priority_rank(priority: &str) -> u8 {
 }
 
 fn parse_candidates(value: &Value) -> Result<Vec<WorkItemSummary>> {
-    let array = locate_array(value).context("could not locate Work Item array in hamstik work list JSON")?;
+    let array = locate_array(value)
+        .context("could not locate Work Item array in hamstik work list JSON")?;
     let mut out = Vec::with_capacity(array.len());
     for item in array {
         if let Some(summary) = parse_summary(item) {
@@ -261,8 +321,15 @@ fn parse_summary(value: &Value) -> Option<WorkItemSummary> {
     let title = scalar_string(obj.get("title")).unwrap_or_else(|| key.clone());
     let status = named_value(obj.get("status")).unwrap_or_default();
     let priority = named_value(obj.get("priority")).unwrap_or_default();
-    let created_at = scalar_string(obj.get("createdAt")).or_else(|| scalar_string(obj.get("created_at")));
-    Some(WorkItemSummary { key, title, status, priority, created_at })
+    let created_at =
+        scalar_string(obj.get("createdAt")).or_else(|| scalar_string(obj.get("created_at")));
+    Some(WorkItemSummary {
+        key,
+        title,
+        status,
+        priority,
+        created_at,
+    })
 }
 
 fn scalar_string(value: Option<&Value>) -> Option<String> {
@@ -302,8 +369,20 @@ mod tests {
     #[test]
     fn priority_breaks_ties() {
         let items = vec![
-            WorkItemSummary { key: "HAM-1".into(), title: "A".into(), status: "todo".into(), priority: "low".into(), created_at: None },
-            WorkItemSummary { key: "HAM-2".into(), title: "B".into(), status: "todo".into(), priority: "urgent".into(), created_at: None },
+            WorkItemSummary {
+                key: "HAM-1".into(),
+                title: "A".into(),
+                status: "todo".into(),
+                priority: "low".into(),
+                created_at: None,
+            },
+            WorkItemSummary {
+                key: "HAM-2".into(),
+                title: "B".into(),
+                status: "todo".into(),
+                priority: "urgent".into(),
+                created_at: None,
+            },
         ];
         assert_eq!(select_next(items).unwrap().key, "HAM-2");
     }

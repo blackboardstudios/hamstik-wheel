@@ -173,8 +173,12 @@ Today Hamstik Wheel provides:
 - crash/resume orchestration state under Git metadata
   (`hamstik-wheel/state.json`);
 - per-Work-Item agent and validation logs under Git metadata;
+- live single-line agent activity rendering with elapsed time (TTY only);
+- timestamped console output (`--timestamps local|utc|none`, local by default)
+  with an optional `--log-file <PATH>` mirror of the whole run;
 - `--max-items` and `max_review_cycles` loop limits;
-- `init`, `doctor`, `once`, `run`, `resume`, and `status`.
+- `init`, `doctor`, `once`, `run`, `resume`, and `status`;
+- `--timestamps` and `--log-file` output logging options.
 
 Release packaging, a `docs/` tree, and multi-agent scale-out are future work;
 concurrency beyond one Work Item is a non-goal by design.
@@ -193,6 +197,58 @@ concurrency beyond one Work Item is a non-goal by design.
 `run` and `once` automatically resume an active Work Item before selecting a
 new one; `resume` exists for when that should be the only thing that happens.
 `--max-items` is optional and defaults to `[loop].max_items`.
+
+## Output logging
+
+All Wheel-generated progress lines (`Selected …`, `[claim]`, `[implement]`,
+`[validate]`, `[review]`, `[commit]`, `[complete]`, doctor results, and errors)
+can be timestamped and mirrored to a file. These are global options, accepted
+before the subcommand:
+
+```bash
+hamstik-wheel --timestamps utc run --max-items 5
+hamstik-wheel --log-file wheel-run.log once
+hamstik-wheel --no-timestamps status
+```
+
+- `--timestamps local|utc|none` — prefix every Wheel line with a millisecond
+  RFC 3339 timestamp. Defaults to `local`; `--no-timestamps` is shorthand for
+  `--timestamps none`.
+- `--log-file <PATH>` — additionally append everything Wheel prints (with the
+  selected timestamps applied) to the given file. The file is opened in append
+  mode and created (including parent directories) if missing, so repeated runs
+  accumulate one continuous history.
+
+Timestamps apply only to lines Wheel generates itself. Validation subprocess
+output is streamed through verbatim — with a timestamp prefix — mirrored into
+`--log-file` when enabled, and continues to be captured verbatim in the
+per-Work-Item logs under Git metadata.
+
+## Live agent activity
+
+While an implementation or review session runs, Wheel renders a single
+in-place console line showing what the agent is doing and for how long:
+
+```text
+[implement] CLI-52 with step-3.7-flash
+[pi] ⠸ bash: cargo test --workspace · 0:03
+[pi] ✓ finished · 4:12
+```
+
+- The line updates in place as the agent works — each `thinking…`,
+  `calling …`, or `tool: argument` event replaces the description — and the
+  elapsed clock keeps ticking between events.
+- One final `[pi] ✓ finished · MM:SS` line is left in scrollback when the
+  session ends, so a completed session costs exactly one line of history.
+- Rendering requires an interactive terminal. With piped output (CI, logs,
+  `--log-file`), the tracker is disabled entirely and nothing is rendered.
+- Wheel launches Pi with `--mode json` to receive these events; `doctor` and
+  `preflight` verify the installed Pi supports JSON output mode and fail with
+  a clear error otherwise.
+- The full event stream is captured verbatim in the per-Work-Item transcript
+  logs under Git metadata (`hamstik-wheel/logs/<KEY>/…`), and the structured
+  `HAMSTIK_WHEEL_RESULT` marker is extracted from the session's final
+  assistant message.
 
 ## Configuration
 
@@ -298,8 +354,8 @@ the pre-review validation evidence — rather than inheriting the implementer's
 assumptions. It is authorized to edit the working tree to fix findings, and it
 also ends with a structured marker: `pass` with zero findings, or `blocked`.
 
-Wheel parses only the final structured marker from each session; it does not
-read or interpret model reasoning.
+Wheel parses only the final structured marker from each session's event
+stream; it does not read or interpret model reasoning for any other purpose.
 
 ## Completion gates
 

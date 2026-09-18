@@ -36,6 +36,7 @@ src/
 ├── pi.rs          Pi subprocess runner, prompts, result parsing
 ├── git.rs         repository/root/head/diff/commit/git-path helpers
 ├── validation.rs  repository command execution and reports
+├── logging.rs     timestamped console logger with optional file mirror
 ├── state.rs       persisted state schema/read/write/clear
 └── loop_engine.rs state machine and phase orchestration
 ```
@@ -300,15 +301,21 @@ State writes SHOULD use write-temp + rename when practical. A partially written 
 
 ### 8.1 Invocation
 
-Pi supports non-interactive print mode and model selection. Wheel invokes:
+Pi supports non-interactive print mode, model selection, and an NDJSON event
+stream. Wheel invokes:
 
 ```bash
-pi --model '<MODEL>' --no-session -p 'Execute the Hamstik Wheel task supplied on stdin.'
+pi --model '<MODEL>' --no-session --mode json -p 'Execute the Hamstik Wheel task supplied on stdin.'
 ```
 
 The complete prompt is piped to stdin. `--no-session` deliberately prevents conversational state from carrying between roles or Work Items.
 
-Wheel should stream Pi stdout to the terminal while retaining it for final-result parsing/logging.
+Wheel reads the NDJSON event stream line-by-line and:
+
+- renders a single in-place activity line (`[pi] <spinner> <description> · <elapsed>`) when stdout is an interactive terminal, leaving one final `[pi] ✓ finished · MM:SS` line in scrollback; nothing is rendered when stdout is not a TTY or `--log-file` is set;
+- retains the complete event stream verbatim as the transcript for result parsing and logging.
+
+Preflight and doctor verify the installed Pi supports `--mode json` and fail with a clear error otherwise.
 
 ### 8.2 Structured terminal marker
 
@@ -331,6 +338,17 @@ HAMSTIK_WHEEL_RESULT={"status":"blocked","summary":"...","findings":["..."]}
 ```
 
 Wheel searches output from the end for the marker, parses the suffix as JSON, and rejects a missing/malformed marker.
+
+Because the transcript is the NDJSON event stream, the marker arrives
+JSON-escaped inside the final assistant message. Extraction handles:
+
+- a plain (unescaped) marker line as before;
+- a marker inside any string value of a parsed event line: the line is
+  decoded with serde_json and every decoded string value is searched for the
+  marker prefix, then the balanced `{...}` payload is extracted (with JSON
+  string-state-aware brace counting) and used directly;
+- a fallback brace-count heuristic on the raw bytes for lines that are not
+  valid JSON.
 
 ### 8.3 Implementation prompt invariants
 
@@ -478,13 +496,16 @@ Checks:
 3. Wheel config parse;
 4. `pi --version`;
 5. optional `pi --list-models <pattern>` sanity for both configured models;
-6. `hamstik --version`;
-7. `hamstik --no-input --json doctor` exit success;
-8. no incompatible active state;
-9. clean working tree when required and no active state;
-10. non-empty validation command set (warning rather than fatal may be configurable later).
+6. `pi --mode json` support (required for activity streaming and marker extraction);
+7. `hamstik --version`;
+8. `hamstik --no-input --json doctor` exit success;
+9. no incompatible active state;
+10. clean working tree when required and no active state;
+11. non-empty validation command set (warning rather than fatal may be configurable later).
 
 ## 13. Logging
+
+### 13.1 Captured agent/validation output
 
 V0.1 SHOULD store captured agent/validation outputs under Git metadata:
 
@@ -496,6 +517,38 @@ hamstik-wheel/logs/<KEY>/final-validation-01.log
 ```
 
 Logs must not intentionally include credentials. Hamstik CLI output is already expected to be redacted; Wheel should never add environment dumps.
+
+### 13.2 Console logging options
+
+Wheel-generated progress lines (selection, phase markers, doctor results, and
+errors) pass through a shared logger that:
+
+- optionally prefixes each line with a millisecond RFC 3339 timestamp
+  (`--timestamps local|utc|none`; `local` is the default and `--no-timestamps`
+  is shorthand for `--timestamps none`);
+- optionally mirrors every printed line, with timestamps applied, into an
+  append-mode file (`--log-file <PATH>`), creating the file and its parent
+  directories when missing.
+
+Agent and validation subprocess output streams through verbatim (no timestamp
+prefix) into both the terminal and the `--log-file` mirror when enabled, and is
+captured verbatim into the per-Work-Item logs above.
+
+### 13.3 Live agent activity rendering
+
+While a Pi session runs, Wheel renders one in-place line (carriage-return
+redraw, space-padded erase) describing current agent activity:
+
+- description comes from the event stream: `thinking…` on thinking start,
+  `calling <tool>…` on toolcall start, `<tool>: <summary>` on tool execution
+  start (summary is the first of `command`, `path`, `file_path`, `pattern`,
+  `query`, `url`, `description` arguments, whitespace-collapsed and truncated
+  to ~48 characters);
+- a spinner and a monotonically increasing `M:SS` / `H:MM:SS` elapsed clock;
+- on session end the tracker prints one final `[pi] ✓ finished · MM:SS` line,
+  so a session contributes exactly one line to scrollback;
+- rendering is disabled entirely when stdout is not a Linux terminal or when
+  `--log-file` is set.
 
 ## 14. Completion comment format
 
@@ -536,7 +589,8 @@ Unit tests should cover:
 - config defaults/deserialization;
 - candidate envelope parsing;
 - candidate status/priority ordering;
-- Pi result marker parsing;
+- Pi result marker parsing, including markers embedded in NDJSON event lines;
+- event-to-activity-description mapping and elapsed-time formatting;
 - state serialization;
 - commit-message expansion;
 - validation report pass/fail aggregation.

@@ -1,7 +1,10 @@
 // Copyright 2026 Blackboard Studios LLC
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -18,7 +21,6 @@ pub struct Config {
     pub git: GitConfig,
     pub comments: CommentsConfig,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -76,7 +78,10 @@ pub struct LoopConfig {
 
 impl Default for LoopConfig {
     fn default() -> Self {
-        Self { max_items: 10, max_review_cycles: 3 }
+        Self {
+            max_items: 10,
+            max_review_cycles: 3,
+        }
     }
 }
 
@@ -107,7 +112,10 @@ pub struct CommentsConfig {
 
 impl Default for CommentsConfig {
     fn default() -> Self {
-        Self { post_started: true, post_completed: true }
+        Self {
+            post_started: true,
+            post_completed: true,
+        }
     }
 }
 
@@ -118,10 +126,14 @@ impl Config {
 
     pub fn load(repo_root: &Path) -> Result<Self> {
         let path = Self::path(repo_root);
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {} (run `hamstik-wheel init` first)", path.display()))?;
-        let config: Config = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let raw = fs::read_to_string(&path).with_context(|| {
+            format!(
+                "failed to read {} (run `hamstik-wheel init` first)",
+                path.display()
+            )
+        })?;
+        let config: Config =
+            toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
         config.validate()?;
         Ok(config)
     }
@@ -166,7 +178,8 @@ impl Config {
             bail!("{} already exists", path.display());
         }
         let config = Config::default();
-        let raw = toml::to_string_pretty(&config).context("failed to render default configuration")?;
+        let raw =
+            toml::to_string_pretty(&config).context("failed to render default configuration")?;
         fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))?;
         Ok(path)
     }

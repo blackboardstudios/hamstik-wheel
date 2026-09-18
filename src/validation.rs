@@ -6,6 +6,8 @@ use std::{path::Path, process::Command};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::logging::Logger;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationCommandResult {
     pub command: String,
@@ -24,7 +26,10 @@ impl ValidationReport {
     pub fn evidence(&self) -> String {
         let mut out = format!("overall: {}\n", if self.passed { "PASS" } else { "FAIL" });
         for item in &self.commands {
-            out.push_str(&format!("\n$ {}\nexit: {:?}\n", item.command, item.exit_code));
+            out.push_str(&format!(
+                "\n$ {}\nexit: {:?}\n",
+                item.command, item.exit_code
+            ));
             if !item.stdout.is_empty() {
                 out.push_str("stdout:\n");
                 out.push_str(&item.stdout);
@@ -40,18 +45,24 @@ impl ValidationReport {
     }
 }
 
-pub fn run_all(repo_root: &Path, commands: &[String]) -> Result<ValidationReport> {
+pub fn run_all(repo_root: &Path, commands: &[String], logger: &Logger) -> Result<ValidationReport> {
     let mut results = Vec::new();
     let mut all_pass = true;
 
     for command in commands {
-        println!("[validate] $ {command}");
+        logger.info(&format!("[validate] $ {command}"));
         let output = shell_command(repo_root, command)
             .with_context(|| format!("failed to execute validation command: {command}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        if !stdout.is_empty() { print!("{stdout}"); }
-        if !stderr.is_empty() { eprint!("{stderr}"); }
+        if !stdout.is_empty() {
+            print!("{stdout}");
+            logger.append_raw(&stdout);
+        }
+        if !stderr.is_empty() {
+            eprint!("{stderr}");
+            logger.append_raw(&stderr);
+        }
         let passed = output.status.success();
         all_pass &= passed;
         results.push(ValidationCommandResult {
@@ -62,17 +73,26 @@ pub fn run_all(repo_root: &Path, commands: &[String]) -> Result<ValidationReport
         });
     }
 
-    Ok(ValidationReport { passed: all_pass, commands: results })
+    Ok(ValidationReport {
+        passed: all_pass,
+        commands: results,
+    })
 }
 
 #[cfg(unix)]
 fn shell_command(repo_root: &Path, command: &str) -> Result<std::process::Output> {
-    Ok(Command::new("sh").current_dir(repo_root).args(["-lc", command]).output()?)
+    Ok(Command::new("sh")
+        .current_dir(repo_root)
+        .args(["-lc", command])
+        .output()?)
 }
 
 #[cfg(windows)]
 fn shell_command(repo_root: &Path, command: &str) -> Result<std::process::Output> {
-    Ok(Command::new("cmd").current_dir(repo_root).args(["/C", command]).output()?)
+    Ok(Command::new("cmd")
+        .current_dir(repo_root)
+        .args(["/C", command])
+        .output()?)
 }
 
 #[cfg(test)]
@@ -82,7 +102,8 @@ mod tests {
     #[test]
     fn empty_validation_set_is_vacuously_passed() {
         let dir = tempfile::tempdir().unwrap();
-        let report = run_all(dir.path(), &[]).unwrap();
+        let logger = Logger::new(crate::logging::TimestampMode::None, None).unwrap();
+        let report = run_all(dir.path(), &[], &logger).unwrap();
         assert!(report.passed);
     }
 }
