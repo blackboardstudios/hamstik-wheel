@@ -176,10 +176,12 @@ impl LoopEngine {
 
         let mut completed = 0usize;
         let mut skipped = 0usize;
+        let mut last_skipped_key: Option<String> = None;
         while completed + skipped < limit {
             match self.process_one()? {
                 ProcessOutcome::Completed => {
                     completed += 1;
+                    last_skipped_key = None;
                     self.logger.blank();
                     self.logger
                         .info(&format!("Completed {completed}/{limit} Work Item(s)."));
@@ -187,6 +189,24 @@ impl LoopEngine {
                 }
                 ProcessOutcome::Skipped => {
                     skipped += 1;
+                    // Guard against a skip loop: if the same item is selected
+                    // and skipped again immediately (it was just returned to
+                    // todo and is still the first candidate), halting is the
+                    // only safe move - continuing would burn the run's limit
+                    // re-failing one item.
+                    let selected_key = self
+                        .store
+                        .load()
+                        .ok()
+                        .and_then(|state| state.current.map(|item| item.key));
+                    if let Some(key) = selected_key {
+                        if last_skipped_key.as_deref() == Some(key.as_str()) {
+                            bail!(
+                                "item {key} was skipped and immediately re-selected; the failure is deterministic (e.g. a claim-time error), so the run stops instead of cycling. Investigate the item's comments and state."
+                            );
+                        }
+                        last_skipped_key = Some(key);
+                    }
                     self.logger.blank();
                     self.logger.info(&format!(
                         "Skipped {skipped}/{limit} Work Item(s) after failure; continuing (on_failure = skip)."
@@ -360,7 +380,17 @@ impl LoopEngine {
                     current.baseline_sha, self.config.models.implement, self.config.models.review
                 );
                 let idem = comment_idempotency_key("start", &current.key, &current.baseline_sha);
-                self.hamstik.add_comment(&current.key, &body, Some(&idem))?;
+                // Bookkeeping comments are advisory: a comment failure must
+                // never fail the item (observed: IDEMPOTENCY_KEY_REUSED after
+                // config changes produced a claim-time skip loop).
+                if let Err(comment_error) =
+                    self.hamstik.add_comment(&current.key, &body, Some(&idem))
+                {
+                    self.logger.warn(&format!(
+                        "[claim] could not post start comment on {}: {comment_error:#}",
+                        current.key
+                    ));
+                }
             }
             state.phase = Phase::Claimed;
             self.store.save(state)?;
@@ -558,7 +588,16 @@ impl LoopEngine {
                     self.config.validation.commands.len(),
                 );
                 let idem = comment_idempotency_key("complete", &current.key, &current.baseline_sha);
-                self.hamstik.add_comment(&current.key, &body, Some(&idem))?;
+                // Advisory like the start comment: never fail a completed item
+                // over a bookkeeping comment.
+                if let Err(comment_error) =
+                    self.hamstik.add_comment(&current.key, &body, Some(&idem))
+                {
+                    self.logger.warn(&format!(
+                        "[complete] could not post completion comment on {}: {comment_error:#}",
+                        current.key
+                    ));
+                }
             }
             self.logger.blank();
             self.logger
@@ -793,7 +832,15 @@ fn sanitize_component(value: &str) -> String {
         .collect()
 }
 
+/// Idempotency key for one specific comment-posting attempt. Includes the
+/// current UTC time so each attempt is its own request; a key shared across
+/// attempts whose bodies differ makes the server reject the retry with
+/// IDEMPOTENCY_KEY_REUSED (observed after changing the review model).
 fn comment_idempotency_key(kind: &str, key: &str, baseline: &str) -> String {
     let short = baseline.chars().take(12).collect::<String>();
-    format!("hamstik-wheel-{kind}-{}-{short}", sanitize_component(key))
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+    format!(
+        "hamstik-wheel-{kind}-{}-{short}-{stamp}",
+        sanitize_component(key)
+    )
 }
