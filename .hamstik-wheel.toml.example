@@ -2,6 +2,10 @@
 # Copy to .hamstik-wheel.toml and adjust for the repository.
 
 [hamstik]
+# Absolute or relative path to the Hamstik CLI binary.
+# Defaults to "hamstik" (resolved via PATH) when omitted.
+cli_path = "hamstik"
+
 # Candidate discovery is scoped to the Organization/Project selected by Hamstik CLI.
 # Epics are excluded by default because Wheel should execute actionable child work.
 statuses = ["todo"]

@@ -23,6 +23,7 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HamstikConfig {
+    pub cli_path: String,
     pub statuses: Vec<String>,
     pub item_types: Vec<String>,
     pub label_names: Vec<String>,
@@ -31,6 +32,7 @@ pub struct HamstikConfig {
 impl Default for HamstikConfig {
     fn default() -> Self {
         Self {
+            cli_path: "hamstik".to_string(),
             statuses: vec!["todo".to_string()],
             item_types: vec![
                 "task".to_string(),
@@ -139,6 +141,9 @@ impl Config {
             if !TYPES.contains(&item_type.as_str()) {
                 bail!("unsupported [hamstik].item_types value `{item_type}`");
             }
+        }
+        if self.hamstik.cli_path.trim().is_empty() {
+            bail!("[hamstik].cli_path must not be empty");
         }
         if self.models.implement.trim().is_empty() {
             bail!("[models].implement must not be empty");

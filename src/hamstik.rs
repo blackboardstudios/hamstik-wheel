@@ -19,24 +19,26 @@ pub struct WorkItemSummary {
 #[derive(Debug, Clone)]
 pub struct HamstikCli {
     repo_root: std::path::PathBuf,
+    cli_path: std::path::PathBuf,
 }
 
 impl HamstikCli {
-    pub fn new(repo_root: &Path) -> Self {
-        Self { repo_root: repo_root.to_path_buf() }
+    pub fn new(repo_root: &Path, cli_path: &str) -> Self {
+        Self { repo_root: repo_root.to_path_buf(), cli_path: std::path::PathBuf::from(cli_path) }
     }
 
     fn run_json(&self, args: &[&str]) -> Result<Value> {
-        let output = Command::new("hamstik")
-            .current_dir(&self.repo_root)
+        let mut cmd = Command::new(&self.cli_path);
+        cmd.current_dir(&self.repo_root)
             .args(["--no-input", "--json"])
-            .args(args)
-            .output()
-            .with_context(|| format!("failed to execute hamstik {}", args.join(" ")))?;
+            .args(args);
+        let output = cmd.output()
+            .with_context(|| format!("failed to execute {} {}", self.cli_path.display(), args.join(" ")))?;
 
         if !output.status.success() {
             bail!(
-                "hamstik {} failed (exit {:?}): {}",
+                "{} {} failed (exit {:?}): {}",
+                self.cli_path.display(),
                 args.join(" "),
                 output.status.code(),
                 String::from_utf8_lossy(&output.stderr).trim()
@@ -44,20 +46,21 @@ impl HamstikCli {
         }
 
         serde_json::from_slice(&output.stdout)
-            .with_context(|| format!("hamstik {} did not return valid JSON", args.join(" ")))
+            .with_context(|| format!("{} {} did not return valid JSON", self.cli_path.display(), args.join(" ")))
     }
 
     fn run_json_owned(&self, args: &[String]) -> Result<Value> {
-        let output = Command::new("hamstik")
-            .current_dir(&self.repo_root)
+        let mut cmd = Command::new(&self.cli_path);
+        cmd.current_dir(&self.repo_root)
             .args(["--no-input", "--json"])
-            .args(args)
-            .output()
-            .with_context(|| format!("failed to execute hamstik {}", args.join(" ")))?;
+            .args(args);
+        let output = cmd.output()
+            .with_context(|| format!("failed to execute {} {}", self.cli_path.display(), args.join(" ")))?;
 
         if !output.status.success() {
             bail!(
-                "hamstik {} failed (exit {:?}): {}",
+                "{} {} failed (exit {:?}): {}",
+                self.cli_path.display(),
                 args.join(" "),
                 output.status.code(),
                 String::from_utf8_lossy(&output.stderr).trim()
@@ -65,7 +68,7 @@ impl HamstikCli {
         }
 
         serde_json::from_slice(&output.stdout)
-            .with_context(|| format!("hamstik {} did not return valid JSON", args.join(" ")))
+            .with_context(|| format!("{} {} did not return valid JSON", self.cli_path.display(), args.join(" ")))
     }
 
     pub fn doctor(&self) -> Result<Value> {
@@ -147,7 +150,7 @@ impl HamstikCli {
     }
 
     pub fn add_comment(&self, key: &str, body: &str, idempotency_key: Option<&str>) -> Result<Value> {
-        let mut command = Command::new("hamstik");
+        let mut command = Command::new(&self.cli_path);
         command
             .current_dir(&self.repo_root)
             .args(["--no-input", "--json", "work", "comment", "add", key, "--body-file", "-"]);

@@ -27,7 +27,7 @@ impl LoopEngine {
     pub fn load() -> Result<Self> {
         let repo = GitRepo::discover()?;
         let config = Config::load(repo.root())?;
-        let hamstik = HamstikCli::new(repo.root());
+        let hamstik = HamstikCli::new(repo.root(), &config.hamstik.cli_path);
         let pi = PiRunner::new(repo.root());
         let state_path = repo.metadata_path("hamstik-wheel/state.json")?;
         let logs_root = repo.metadata_path("hamstik-wheel/logs")?;
@@ -42,7 +42,7 @@ impl LoopEngine {
         println!("✓ Git repository: {}", self.repo.root().display());
         println!("✓ Configuration: {}", Config::path(self.repo.root()).display());
         failed |= !check_process("pi", &["--version"]);
-        failed |= !check_process("hamstik", &["--version"]);
+        failed |= !check_process(&self.config.hamstik.cli_path, &["--version"]);
 
         match self.hamstik.verify_required_commands() {
             Ok(()) => println!("✓ Hamstik CLI command manifest supports Wheel requirements"),
@@ -145,7 +145,7 @@ impl LoopEngine {
 
     fn preflight(&self) -> Result<()> {
         require_process("pi", &["--version"])?;
-        require_process("hamstik", &["--version"])?;
+        require_process(&self.config.hamstik.cli_path, &["--version"])?;
         self.hamstik.verify_required_commands()?;
         self.hamstik.doctor()?;
         if !check_pi_model(&self.config.models.implement) {
