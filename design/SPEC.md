@@ -67,6 +67,9 @@ commands = ["./scripts/do-prechecks.py"]
 [loop]
 max_items = 10
 max_review_cycles = 3
+on_failure = "halt"
+agent_timeout_minutes = 45
+implement_retry = true
 
 [git]
 require_clean_start = true
@@ -570,23 +573,50 @@ Start comment should be similarly concise.
 
 ## 15. Error handling
 
-Errors are fatal to the active loop unless explicitly classified as a retryable review cycle.
+By default, errors are fatal to the active loop (`[loop].on_failure = "halt"`).
+With `on_failure = "skip"`, a failed Work Item is handled as follows and the
+run continues with the next item:
+
+1. the failure is recorded in persisted state (`lastError`) and in a failure
+   comment on the Work Item (idempotency-keyed, best-effort);
+2. in-progress working-tree changes, when any exist, are committed to a
+   `wheel/wip/<KEY>` branch (never touching the current branch's history);
+3. the working tree is restored to that item's recorded baseline
+   (`git reset --hard <baseline>` and `git clean -fd`) so the next
+   selection's clean-tree check passes; a failed restore or preservation
+   halts the run regardless of mode;
+4. the item is transitioned back to `todo` (best-effort) so it stays in the
+   eligible pool for later runs;
+5. active state is cleared and the loop advances.
+
+Additional resilience controls:
+
+- `[loop].agent_timeout_minutes` caps each agent session's wall-clock time;
+  on expiry the Pi process is killed, the partial event transcript is kept,
+  and the session is treated as a failure (retried once for implementation
+  when `implement_retry` is enabled). `0` disables the cap.
+- `[loop].implement_retry = true` re-runs the implementation session exactly
+  once when the first attempt fails to produce a parsable result marker;
+  explicit `blocked` results and non-marker-producing retries are final.
+- `run` counts skipped items and reports them in the run summary; `once`
+  treats a skipped item as a completed outcome.
 
 Wheel MUST NOT:
 
 - close a Work Item after a failed gate;
-- erase working-tree changes on failure;
-- `git reset --hard` automatically;
+- erase working-tree changes on failure without first preserving them on a
+  `wheel/wip/<KEY>` branch (the skip path preserves before restoring);
 - automatically stash unrelated user changes;
 - select a new Work Item while active state exists;
 - retry authentication errors indefinitely;
+- retry a `blocked` implementation/review result;
 - parse human-formatted Hamstik output when JSON was expected.
 
 ## 16. Testing strategy
 
 Unit tests should cover:
 
-- config defaults/deserialization;
+- config defaults/deserialization, including `on_failure`, timeout, and retry options;
 - candidate envelope parsing;
 - candidate status/priority ordering;
 - Pi result marker parsing, including markers embedded in NDJSON event lines;

@@ -23,6 +23,8 @@ pub struct ValidationReport {
 }
 
 impl ValidationReport {
+    /// Full evidence: per-command exit, stdout, and stderr. Used for the
+    /// per-Work-Item validation logs.
     pub fn evidence(&self) -> String {
         let mut out = format!("overall: {}\n", if self.passed { "PASS" } else { "FAIL" });
         for item in &self.commands {
@@ -43,6 +45,60 @@ impl ValidationReport {
         }
         out
     }
+
+    /// Bounded digest for review prompts: per-command status plus the tail of
+    /// each stream, capped so the review prompt cannot overflow the model
+    /// context. The full output is available in the validation log file.
+    pub fn evidence_digest(&self, max_chars_per_stream: usize) -> String {
+        let mut out = format!(
+            "overall: {}\n(full untruncated output is saved in .git/hamstik-wheel/logs/<KEY>/pre-review-validation.log)\n",
+            if self.passed { "PASS" } else { "FAIL" }
+        );
+        for item in &self.commands {
+            let status = if item.exit_code == Some(0) {
+                "PASS"
+            } else {
+                "FAIL"
+            };
+            out.push_str(&format!("\n$ {} -> {}\n", item.command, status));
+            for (label, text) in [("stdout", &item.stdout), ("stderr", &item.stderr)] {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let (body, truncated) = tail_chars(text, max_chars_per_stream);
+                out.push_str(&format!(
+                    "{label}{}:\n{body}\n",
+                    if truncated {
+                        " (truncated, tail only)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+        }
+        out
+    }
+}
+
+/// Return the last `max` characters of `text`, aligning the cut to a line
+/// boundary so the digest never starts mid-word.
+fn tail_chars(text: &str, max: usize) -> (String, bool) {
+    if text.chars().count() <= max {
+        return (text.to_string(), false);
+    }
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(max)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let cleaned = match tail.find('\n') {
+        Some(pos) if pos < tail.len() - 1 => tail[pos + 1..].to_string(),
+        _ => tail,
+    };
+    (cleaned, true)
 }
 
 pub fn run_all(repo_root: &Path, commands: &[String], logger: &Logger) -> Result<ValidationReport> {
@@ -105,5 +161,31 @@ mod tests {
         let logger = Logger::new(crate::logging::TimestampMode::None, None).unwrap();
         let report = run_all(dir.path(), &[], &logger).unwrap();
         assert!(report.passed);
+    }
+
+    #[test]
+    fn evidence_digest_truncates_large_streams() {
+        let report = ValidationReport {
+            passed: true,
+            commands: vec![ValidationCommandResult {
+                command: "cargo test".into(),
+                exit_code: Some(0),
+                stdout: format!("line\n{}", "x".repeat(100_000)),
+                stderr: String::new(),
+            }],
+        };
+        let digest = report.evidence_digest(2000);
+        assert!(digest.chars().count() < 2500);
+        assert!(digest.contains("(truncated, tail only)"));
+        assert!(digest.contains("-> PASS"));
+    }
+
+    #[test]
+    fn tail_chars_aligns_to_line_boundary() {
+        let text = "first line\nsecond line\nthird line\n";
+        let (tail, truncated) = tail_chars(text, 15);
+        assert!(truncated);
+        assert!(!tail.starts_with("st line"));
+        assert!(tail.starts_with("second") || tail.starts_with("third"));
     }
 }

@@ -176,7 +176,8 @@ Today Hamstik Wheel provides:
 - live single-line agent activity rendering with elapsed time (TTY only);
 - timestamped console output (`--timestamps local|utc|none`, local by default)
   with an optional `--log-file <PATH>` mirror of the whole run;
-- `--max-items` and `max_review_cycles` loop limits;
+- `--max-items`, `max_review_cycles`, and the unattended-resilience options
+  (`on_failure`, `agent_timeout_minutes`, `implement_retry`);
 - `init`, `doctor`, `once`, `run`, `resume`, and `status`;
 - `--timestamps` and `--log-file` output logging options.
 
@@ -280,6 +281,9 @@ commands = [
 [loop]
 max_items = 10
 max_review_cycles = 3
+on_failure = "skip"
+agent_timeout_minutes = 45
+implement_retry = true
 
 [git]
 require_clean_start = true
@@ -303,7 +307,12 @@ post_completed = true
   configured, `doctor` warns that the final gate relies on review only.
 - **`[loop]`** — `max_items` bounds a `run` invocation when `--max-items` is
   omitted; `max_review_cycles` bounds review/remediation iterations per Work
-  Item.
+  Item; `on_failure = "skip"` makes the run record the failure, restore the
+  item's baseline tree, and continue with the next item instead of stopping
+  (`"halt"` stops the run — the default); `agent_timeout_minutes` caps each
+  agent session's wall-clock time (0 disables); `implement_retry` retries the
+  implementation session once when it fails to produce a parsable result
+  marker.
 - **`[git]`** — `require_clean_start` blocks new selection on a dirty working
   tree; `commit` controls whether Wheel commits; `commit_message` supports the
   `{key}` and `{title}` placeholders.
@@ -384,6 +393,21 @@ a failure and fed into the next review cycle, as is a failed final validation.
 Review/remediation repeats up to `max_review_cycles`; if the loop never
 converges, Wheel stops with an error, leaves the Work Item open, and keeps its
 state persisted for inspection or `resume`.
+
+### Unattended runs
+
+`[loop].on_failure = "skip"` makes multi-item runs resilient: when an item
+fails (agent error/timeout, non-converging review, `blocked` result), Wheel
+posts a failure comment on the item, preserves the session's in-progress
+changes on a `wheel/wip/<KEY>` branch (when any exist), restores the working
+tree to that item's baseline, transitions the item back to `todo` so it
+stays eligible for later runs, and continues with the next item. The run
+summary reports how many items were skipped. Combined with
+`agent_timeout_minutes` (a hung session is killed at the wall-clock cap) and
+`implement_retry` (one extra session when the first attempt emits no
+parsable result), a `run` can process a queue overnight: one bad item costs
+that item, not the whole night. Skipped items keep their failure comment
+and WIP branch for manual pickup or a later automated attempt.
 
 When the gates pass, Wheel commits with `git add -A` and the configured
 message template, records the commit SHA, and asks Hamstik CLI to close the

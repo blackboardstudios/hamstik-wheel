@@ -4,7 +4,8 @@
 use std::{
     io::{BufRead, BufReader, Write},
     path::Path,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -44,7 +45,13 @@ impl PiRunner {
         }
     }
 
-    pub fn run(&self, model: &str, prompt: &str, logger: &Logger) -> Result<PiRun> {
+    pub fn run(
+        &self,
+        model: &str,
+        prompt: &str,
+        timeout: Option<Duration>,
+        logger: &Logger,
+    ) -> Result<PiRun> {
         let mut child = Command::new("pi")
             .current_dir(&self.repo_root)
             .args([
@@ -74,29 +81,54 @@ impl PiRunner {
         drop(child.stdin.take());
 
         let stdout = child.stdout.take().context("failed to open Pi stdout")?;
-        let reader = BufReader::new(stdout);
-        let mut transcript = String::new();
-        let mut read_error = None;
-        let mut tracker = ActivityTracker::start(logger.activity_enabled());
-        for line in reader.lines() {
-            match line {
-                Ok(line) => {
-                    if let Some(update) = crate::activity::description_from_event(&line) {
-                        tracker.update(update);
+        let tracker = ActivityTracker::start(logger.activity_enabled());
+        let activity = tracker.handle();
+
+        // Collect stdout on a dedicated thread. This lets the main thread
+        // enforce a wall-clock deadline: the reader always drains the stream
+        // to completion while wait-with-timeout decides when to kill Pi.
+        let reader_thread = std::thread::Builder::new()
+            .name("pi-stdout".to_string())
+            .spawn(move || {
+                let reader = BufReader::new(stdout);
+                let mut transcript = String::new();
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) => {
+                            if let Some(update) = crate::activity::description_from_event(&line) {
+                                activity.update(update);
+                            }
+                            transcript.push_str(&line);
+                            transcript.push('\n');
+                        }
+                        Err(_) => break,
                     }
-                    transcript.push_str(&line);
-                    transcript.push('\n');
                 }
-                Err(error) => {
-                    read_error = Some(anyhow!("failed reading Pi stdout: {error}"));
-                    break;
-                }
-            }
-        }
+                transcript
+            })
+            .context("failed to spawn Pi stdout reader thread")?;
+
+        // Wait for Pi with an optional hard wall-clock limit. On timeout the
+        // process is killed; the reader thread still drains the pipe to EOF.
+        let wait_error = match timeout {
+            None => match child.wait() {
+                Ok(_) => None,
+                Err(error) => Some(anyhow!("failed waiting for Pi: {error}")),
+            },
+            Some(limit) => match wait_with_timeout(&mut child, limit) {
+                Ok(()) => None,
+                Err(error) => Some(anyhow!(
+                    "Pi model {model} exceeded the session timeout of {}s: {error}",
+                    limit.as_secs()
+                )),
+            },
+        };
+
+        let transcript = reader_thread.join().unwrap_or_default();
         tracker.finish();
 
         let status = child.wait().context("failed waiting for Pi")?;
-        let result = if let Some(error) = write_error.or(read_error) {
+        let result = if let Some(error) = write_error.or(wait_error) {
             Err(error)
         } else if !status.success() {
             Err(anyhow!(
@@ -108,6 +140,25 @@ impl PiRunner {
         };
 
         Ok(PiRun { result, transcript })
+    }
+}
+
+/// Wait for a child process with a wall-clock limit, killing it (and its
+/// process group) when the limit elapses. Requires the child spawned with
+/// `kill_on_drop`-like handling; std lacks this, so we poll.
+fn wait_with_timeout(child: &mut Child, limit: Duration) -> Result<()> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait().context("failed polling Pi status")? {
+            let _ = status;
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("session terminated after exceeding the wall-clock limit");
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 
@@ -127,9 +178,9 @@ Your responsibilities:
 1. Inspect the existing repository architecture, conventions, tests, and relevant design documentation before editing.
 2. Implement the Work Item completely and satisfy every acceptance criterion.
 3. Add or update tests for changed behavior where appropriate.
-4. Run useful repository checks during implementation.
+4. Run useful repository checks during implementation. Your session has a hard wall-clock limit: prefer targeted checks (`cargo check -p <crate>`) over the full precheck suite — Hamstik Wheel runs full validation after implementation.
 5. Keep changes scoped to this Work Item; do not rewrite unrelated behavior merely to make the task easier.
-6. Inspect any existing partial working-tree changes and continue them safely if this is a resumed run.
+6. Inspect any existing partial working-tree changes and continue them safely if this is a resumed run. A previous session's partial work may exist on a `wheel/wip/<KEY>` branch; inspect it with `git log wheel/wip/{key}` and reuse what is salvageable.
 7. Do NOT change the Hamstik Work Item status, add Hamstik comments, or close the Work Item. Hamstik Wheel owns lifecycle.
 8. Do NOT create a Git commit. Leave the complete implementation in the working tree for independent review.
 9. If requirements are materially ambiguous/conflicting or safe completion is impossible, stop without inventing requirements.
@@ -164,8 +215,10 @@ Do not trust conclusions from the implementation agent. Independently inspect th
 HAMSTIK_CONTEXT_JSON:
 {}
 
-PREVIOUS_VALIDATION_EVIDENCE:
+PREVIOUS_VALIDATION_EVIDENCE (digested; full untruncated output is in .git/hamstik-wheel/logs/{key}/ under Git metadata — read it from there if you need more detail):
 {validation_evidence}
+
+Budget your work: you have a hard session wall-clock limit. Inspect the diff (`git diff {baseline}`), read only the files it touches, and do not dump large outputs to the console.
 
 Review for at least:
 - every requirement and acceptance criterion;
@@ -179,7 +232,12 @@ Review for at least:
 - unnecessary complexity or duplication;
 - required documentation changes.
 
-You are authorized to edit the working tree to fix every actionable finding. After fixes, run appropriate tests/checks and review the resulting diff again. Continue until there are zero unresolved actionable findings or you determine safe completion is blocked.
+You are authorized to edit the working tree to fix every actionable finding. After fixes, review the resulting diff again. Continue until there are zero unresolved actionable findings or you determine safe completion is blocked.
+
+Work within a strict time budget — your session has a hard wall-clock limit and a previous review was killed mid-remediation after 45 minutes. Therefore:
+- Inspect `git diff {baseline}` first; read only files the diff touches.
+- Do NOT run the repository's full precheck script or the whole test suite; Hamstik Wheel runs full validation itself after your review. For quick feedback use targeted checks only (e.g. `cargo check -p <touched-crate> --all-targets`), at most a handful of times.
+- Prefer small, decisive fixes over exploratory loops. When you are more than halfway through your budget, stop fixing and emit the marker.
 
 Do NOT change Hamstik Work Item status/comments and do NOT create a Git commit. Hamstik Wheel owns those actions.
 

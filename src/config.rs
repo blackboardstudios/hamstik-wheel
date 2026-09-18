@@ -69,11 +69,29 @@ pub struct ValidationConfig {
     pub commands: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OnFailure {
+    /// Stop the run when a Work Item fails (current default).
+    #[default]
+    Halt,
+    /// Record the failure, restore the baseline working tree, and continue
+    /// with the next Work Item.
+    Skip,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoopConfig {
     pub max_items: usize,
     pub max_review_cycles: usize,
+    pub on_failure: OnFailure,
+    /// Wall-clock cap for each agent (implement/review) session, in minutes.
+    /// Zero disables the cap.
+    pub agent_timeout_minutes: u64,
+    /// One extra implementation attempt when the first session fails to
+    /// produce a parsable result marker.
+    pub implement_retry: bool,
 }
 
 impl Default for LoopConfig {
@@ -81,6 +99,9 @@ impl Default for LoopConfig {
         Self {
             max_items: 10,
             max_review_cycles: 3,
+            on_failure: OnFailure::Halt,
+            agent_timeout_minutes: 45,
+            implement_retry: true,
         }
     }
 }
@@ -203,5 +224,39 @@ mod tests {
         let raw = toml::to_string(&Config::default()).unwrap();
         let parsed: Config = toml::from_str(&raw).unwrap();
         parsed.validate().unwrap();
+    }
+
+    #[test]
+    fn on_failure_accepts_skip_and_halt() {
+        for value in ["halt", "skip"] {
+            let parsed: Config =
+                toml::from_str(&format!("[loop]\non_failure = \"{value}\"\n")).unwrap();
+            parsed.validate().unwrap();
+        }
+        assert!(toml::from_str::<Config>("[loop]\non_failure = \"restart\"\n").is_err());
+    }
+
+    #[test]
+    fn overnight_settings_round_trip() {
+        let raw = r#"
+[loop]
+max_items = 5
+max_review_cycles = 3
+on_failure = "skip"
+agent_timeout_minutes = 60
+implement_retry = true
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(parsed.r#loop.on_failure, OnFailure::Skip);
+        assert_eq!(parsed.r#loop.agent_timeout_minutes, 60);
+        assert!(parsed.r#loop.implement_retry);
+    }
+
+    #[test]
+    fn zero_agent_timeout_disables_cap() {
+        let parsed: Config = toml::from_str("[loop]\nagent_timeout_minutes = 0\n").unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(parsed.r#loop.agent_timeout_minutes, 0);
     }
 }

@@ -56,9 +56,17 @@ impl ActivityTracker {
         }
     }
 
+    #[allow(dead_code)] // superseded by handle(); retained for direct owners
     pub fn update(&self, description: Option<String>) {
         if let Ok(mut guard) = self.shared.description.lock() {
             *guard = description;
+        }
+    }
+
+    /// A thread-safe handle sharing this tracker's state so another thread
+    pub fn handle(&self) -> ActivityHandle {
+        ActivityHandle {
+            shared: Arc::clone(&self.shared),
         }
     }
 
@@ -68,10 +76,12 @@ impl ActivityTracker {
 
     /// Stop the ticker, erase the ephemeral line, and print one final
     /// terminal-activity line so the scrollback keeps a single record.
-    pub fn finish(&mut self) {
+    pub fn finish(&self) {
         self.shared.done.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        if let Some(worker) = self.worker.as_ref() {
+            let _ = worker;
+            // The render loop exits on its next tick after the done flag;
+            // Drop performs the final join to avoid blocking the caller.
         }
         if !self.enabled {
             return;
@@ -89,6 +99,20 @@ impl Drop for ActivityTracker {
         self.shared.done.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+    }
+}
+
+/// Thread-safe update-only view of an `ActivityTracker`.
+#[derive(Clone)]
+pub struct ActivityHandle {
+    shared: Arc<Shared>,
+}
+
+impl ActivityHandle {
+    pub fn update(&self, description: Option<String>) {
+        if let Ok(mut guard) = self.shared.description.lock() {
+            *guard = description;
         }
     }
 }

@@ -115,6 +115,7 @@ impl HamstikCli {
             "hamstik work context",
             "hamstik work start",
             "hamstik work close",
+            "hamstik work transition",
             "hamstik work comment add",
         ];
 
@@ -189,6 +190,12 @@ impl HamstikCli {
 
     pub fn close(&self, key: &str) -> Result<Value> {
         self.run_json(&["work", "close", key])
+    }
+
+    /// Transition an item to an arbitrary allowed target status (e.g. `todo`
+    /// when a skipped item should return to the eligible pool).
+    pub fn transition(&self, key: &str, target: &str) -> Result<Value> {
+        self.run_json(&["work", "transition", key, target])
     }
 
     pub fn add_comment(

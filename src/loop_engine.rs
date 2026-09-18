@@ -10,7 +10,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 
 use crate::{
-    config::Config,
+    config::{self, Config},
     git::GitRepo,
     hamstik::{select_next, HamstikCli},
     logging::Logger,
@@ -175,7 +175,8 @@ impl LoopEngine {
         }
 
         let mut completed = 0usize;
-        while completed < limit {
+        let mut skipped = 0usize;
+        while completed + skipped < limit {
             match self.process_one()? {
                 ProcessOutcome::Completed => {
                     completed += 1;
@@ -184,11 +185,23 @@ impl LoopEngine {
                         .info(&format!("Completed {completed}/{limit} Work Item(s)."));
                     self.logger.blank();
                 }
+                ProcessOutcome::Skipped => {
+                    skipped += 1;
+                    self.logger.blank();
+                    self.logger.info(&format!(
+                        "Skipped {skipped}/{limit} Work Item(s) after failure; continuing (on_failure = skip)."
+                    ));
+                    self.logger.blank();
+                }
                 ProcessOutcome::NoWork => {
                     self.logger.info("No eligible Hamstik Work Items found.");
                     break;
                 }
             }
+        }
+        if skipped > 0 {
+            self.logger
+                .warn(&format!("Run finished with {skipped} skipped Work Item(s); see the per-item comments and state for details."));
         }
         Ok(())
     }
@@ -196,7 +209,7 @@ impl LoopEngine {
     pub fn once(&self) -> Result<()> {
         self.preflight()?;
         match self.process_one()? {
-            ProcessOutcome::Completed => Ok(()),
+            ProcessOutcome::Completed | ProcessOutcome::Skipped => Ok(()),
             ProcessOutcome::NoWork => {
                 self.logger.info("No eligible Hamstik Work Items found.");
                 Ok(())
@@ -271,8 +284,54 @@ impl LoopEngine {
         }
 
         if let Err(error) = self.process_active(&mut state) {
-            state.last_error = Some(format!("{error:#}"));
+            let error_text = format!("{error:#}");
+            state.last_error = Some(error_text.clone());
             let _ = self.store.save(&mut state);
+
+            if self.config.r#loop.on_failure == config::OnFailure::Skip {
+                let (key, title, baseline) = match state.current.as_ref() {
+                    Some(active) => (
+                        active.key.clone(),
+                        active.title.clone(),
+                        active.baseline_sha.clone(),
+                    ),
+                    None => (String::new(), String::new(), String::new()),
+                };
+                if !key.is_empty() {
+                    // Preserve the session's in-progress changes on a WIP
+                    // branch, then restore the baseline so the next
+                    // selection's clean-tree check passes.
+                    let wip_branch = match self.repo.preserve_wip(&key, &baseline) {
+                        Ok(branch) => branch,
+                        Err(preserve_error) => {
+                            state.last_error = Some(format!(
+                                "{error_text}; WIP preservation failed: {preserve_error:#}"
+                            ));
+                            let _ = self.store.save(&mut state);
+                            self.logger.error(&format!(
+                                "[skip] {} could not preserve in-progress changes: {preserve_error:#}; halting the run",
+                                key
+                            ));
+                            return Err(anyhow::anyhow!(error_text)
+                                .context("skipped-item WIP preservation failed"));
+                        }
+                    };
+                    if let Some(branch) = wip_branch.as_deref() {
+                        self.logger.info(&format!(
+                            "[cleanup] {} in-progress changes preserved on branch `{branch}`",
+                            key
+                        ));
+                    }
+                    self.record_skip(&key, &title, &baseline, &error_text, wip_branch.as_deref())?;
+                    self.reopen_item(&key, &title);
+                    self.store.clear_active(&mut state)?;
+                    self.logger.info(&format!(
+                        "[skip] {} recorded; item returned to the eligible pool; continuing",
+                        key
+                    ));
+                    return Ok(ProcessOutcome::Skipped);
+                }
+            }
             return Err(error);
         }
 
@@ -321,9 +380,7 @@ impl LoopEngine {
                 &current.baseline_sha,
                 &context,
             );
-            let run = self
-                .pi
-                .run(&self.config.models.implement, &prompt, &self.logger)?;
+            let run = self.run_implement_session(&current.key, &prompt)?;
             self.write_log(&current.key, "implement.log", &run.transcript)?;
             let result = run.result.with_context(|| {
                 format!(
@@ -353,9 +410,11 @@ impl LoopEngine {
                     &self.config.validation.commands,
                     &self.logger,
                 )?;
-                let evidence = report.evidence();
-                self.write_log(&current.key, "pre-review-validation.log", &evidence)?;
-                evidence
+                let full_evidence = report.evidence();
+                self.write_log(&current.key, "pre-review-validation.log", &full_evidence)?;
+                // Bounded digest for the prompt: full output can exceed the
+                // review model's context window (observed: 49K-token overflow).
+                report.evidence_digest(2000)
             } else {
                 "This is a resumed review phase. Independently inspect the current working tree and rerun relevant checks; do not assume an earlier review result still applies.".to_string()
             };
@@ -379,9 +438,7 @@ impl LoopEngine {
                     &evidence,
                     cycle,
                 );
-                let run = self
-                    .pi
-                    .run(&self.config.models.review, &prompt, &self.logger)?;
+                let run = self.run_agent(&self.config.models.review, &prompt)?;
                 let review_log = format!("review-{cycle:02}.log");
                 self.write_log(&current.key, &review_log, &run.transcript)?;
                 let review = run.result.with_context(|| {
@@ -429,7 +486,7 @@ impl LoopEngine {
                     passed = true;
                     break;
                 }
-                evidence = final_evidence;
+                evidence = final_report.evidence_digest(2000);
             }
 
             if !passed {
@@ -539,11 +596,92 @@ impl LoopEngine {
         fs::write(path, content)?;
         Ok(())
     }
+
+    fn agent_timeout(&self) -> Option<std::time::Duration> {
+        let minutes = self.config.r#loop.agent_timeout_minutes;
+        (minutes > 0).then(|| std::time::Duration::from_secs(minutes * 60))
+    }
+
+    fn run_agent(&self, model: &str, prompt: &str) -> Result<crate::pi::PiRun> {
+        self.pi
+            .run(model, prompt, self.agent_timeout(), &self.logger)
+    }
+
+    /// Run one implementation session, with an optional single automatic
+    /// retry when the first session fails to produce a parsable result
+    /// marker (process errors and timeouts are also retried once; explicit
+    /// `blocked` results never are).
+    fn run_implement_session(&self, key: &str, prompt: &str) -> Result<crate::pi::PiRun> {
+        let mut run = self.run_agent(&self.config.models.implement, prompt)?;
+        if run.result.is_err() && self.config.r#loop.implement_retry {
+            let retry_log = "implement-retry.log";
+            self.logger.warn(&format!(
+                "[implement] {key}: first session did not produce a parsable result; retrying once"
+            ));
+            let retry = self.run_agent(&self.config.models.implement, prompt)?;
+            self.write_log(key, retry_log, &retry.transcript)?;
+            if retry.result.is_ok() {
+                run = retry;
+            } else {
+                return Err(run
+                    .result
+                    .err()
+                    .map(|error| {
+                        anyhow::anyhow!(error.to_string())
+                            .context("implementation agent failed (after one retry)")
+                    })
+                    .unwrap_or_else(|| {
+                        anyhow::anyhow!("implementation agent failed (after one retry)")
+                    }));
+            }
+        }
+        Ok(run)
+    }
+
+    /// Record a failure comment on the Work Item so the run's history shows
+    /// what happened overnight, then clear active state (skip path).
+    fn record_skip(
+        &self,
+        key: &str,
+        title: &str,
+        baseline: &str,
+        error: &str,
+        wip_branch: Option<&str>,
+    ) -> Result<()> {
+        self.logger.blank();
+        self.logger.warn(&format!("[skip] {key}: {error}"));
+        let wip_note = match wip_branch {
+            Some(branch) => format!("\n- Partial in-progress changes preserved on branch `{branch}` (inspect with `git diff {baseline} {branch}`)"),
+            None => String::new(),
+        };
+        let body = format!(
+            "Hamstik Wheel could not complete automated work for this Work Item and moved on (on_failure = skip).\n\n- Failure: {error}\n- Baseline: `{baseline}`{wip_note}\n- The item was returned to `todo` and stays eligible for later runs"
+        );
+        let idem = comment_idempotency_key("skip", key, baseline);
+        if let Err(comment_error) = self.hamstik.add_comment(key, &body, Some(&idem)) {
+            self.logger.warn(&format!(
+                "[skip] could not post failure comment on {title}: {comment_error:#}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Best-effort transition of a skipped item back to `todo` so it remains
+    /// in the eligible pool for later runs. Failures are non-fatal: the skip
+    /// already recorded the outcome, and a manual transition is possible.
+    fn reopen_item(&self, key: &str, title: &str) {
+        if let Err(error) = self.hamstik.transition(key, "todo") {
+            self.logger.warn(&format!(
+                "[skip] could not return {title} to todo ({error:#}); move it back manually"
+            ));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessOutcome {
     Completed,
+    Skipped,
     NoWork,
 }
 
