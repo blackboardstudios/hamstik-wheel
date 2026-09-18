@@ -1,122 +1,225 @@
-# Hamstik Wheel
+<p align="center">
+  <img
+    src="assets/readme-header-logo.png"
+    alt="Hamstik Wheel — autonomous work-item delivery for Hamstik"
+    width="100%"
+  />
+</p>
 
-**Autonomously work through your Hamstik backlog, one item at a time.**
+Hamstik Wheel is a small, local autonomous orchestration tool for
+[Hamstik](https://hamstik.com)-managed software projects. It turns a Hamstik
+backlog into reviewed, committed code — one Work Item at a time, inside your
+own repository, using your own validation tooling.
 
-Hamstik Wheel is a small, local orchestration tool for software repositories managed in Hamstik. It uses the existing `hamstik` CLI as the sole integration boundary to Hamstik, runs one Pi implementation agent, runs a fresh Pi review/remediation agent with a different model, verifies repository-defined checks, commits the result, and then asks Hamstik CLI to close the Work Item.
+Wheel uses the existing [Hamstik CLI](https://github.com/blackboardstudios/hamstik-cli)
+as its exclusive Hamstik integration boundary. For each eligible Work Item it
+runs a Pi implementation session, validates the repository, runs a fresh,
+independent Pi review/remediation session, validates again, commits the
+result, asks Hamstik CLI to close the Work Item, and then repeats with the
+next eligible item.
 
-```text
-Hamstik backlog
-      ↓
-  Hamstik CLI
-      ↓
- Hamstik Wheel
-      ↓
- Step implementer
-      ↓
- repository checks
-      ↓
- GLM reviewer/fixer
-      ↓
- repository checks
-      ↓
- git commit
-      ↓
- Hamstik Work Item → Done
-      ↓
-     repeat
-```
+> **Status:** Early development. Hamstik Wheel is intentionally focused on a
+> simple, observable, one-Work-Item-at-a-time autonomous delivery loop.
 
-> **Project status:** early v0.1 implementation. The architecture and command boundaries are intentionally narrow so the first usable version stays simple, observable, and reliable.
-
-## Design principles
-
-- **Hamstik CLI is the Hamstik boundary.** Wheel does not implement Hamstik HTTP, PAT storage, API model refresh, profiles, or context resolution.
-- **One Work Item at a time.** No worker pools, worktrees, schedulers, or distributed-agent framework in v1.
-- **Fresh review context.** Implementation and review are separate Pi processes and may use different models.
-- **Wheel owns lifecycle truth.** Agents never mark a Work Item done. Wheel does that only after review and validation gates pass.
-- **Git and Hamstik are durable state.** Wheel stores only minimal orchestration state under Git's metadata path so it never dirties the repository.
-- **No tmux dependency.** Run Wheel inside tmux if you want durable terminal attachment; tmux is not part of orchestration.
-
-## Requirements
-
-- Git
-- [Pi coding agent](https://github.com/earendil-works/pi)
-- [Hamstik CLI](https://github.com/blackboardstudios/hamstik-cli)
-- Rust toolchain for building from source
-- An initialized Git repository
-- Hamstik CLI authenticated and configured with an Organization/Project context
-
-Hamstik CLI already provides the machine-oriented surfaces Wheel needs, including `hamstik doctor --json`, `hamstik work list --json`, `hamstik work context <KEY> --json`, `hamstik work start`, `hamstik work close`, and Work Item comments.
-
-## Build
-
-```bash
-cargo build --release
-```
-
-The resulting binary is:
-
-```bash
-./target/release/hamstik-wheel
-```
+[![CI](https://github.com/blackboardstudios/hamstik-wheel/actions/workflows/ci.yml/badge.svg)](https://github.com/blackboardstudios/hamstik-wheel/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 ## Quick start
 
-From a repository already connected to the desired Hamstik Organization/Project with Hamstik CLI:
+### Requirements
+
+- Git
+- The [Pi coding agent](https://github.com/earendil-works/pi) (`pi` on `PATH`)
+- [Hamstik CLI](https://github.com/blackboardstudios/hamstik-cli) (`hamstik` on
+  `PATH`, or configured through `[hamstik].cli_path`)
+- A Rust toolchain when building from source (the repository pins `stable`
+  through `rust-toolchain.toml`)
+- A Git repository — Wheel always operates on the repository it is started in
+- An authenticated Hamstik CLI with the desired Organization/Project context
+  selected
+
+Wheel does not manage Hamstik authentication. Sign in and select context with
+Hamstik CLI (`hamstik auth login`, `hamstik context init --org acme --project
+HAM`); Wheel inherits exactly what Hamstik CLI resolves at runtime.
+
+### Build from source
+
+Wheel is not yet published to crates.io or as release archives. Build it from
+source:
+
+```bash
+git clone https://github.com/blackboardstudios/hamstik-wheel.git
+cd hamstik-wheel
+cargo build --release
+./target/release/hamstik-wheel --version
+```
+
+Optionally install the binary into Cargo's binary directory:
+
+```bash
+cargo install --path . --locked
+```
+
+### Initialize a repository
+
+From a repository already connected to the desired Hamstik Organization/Project:
 
 ```bash
 hamstik-wheel init
 $EDITOR .hamstik-wheel.toml
+```
+
+`init` writes the default configuration. Review the Work Item filters
+(`[hamstik]`), the model pair (`[models]`), and — importantly — set
+`[validation].commands` to the checks your repository defines. The checked-in
+[.hamstik-wheel.toml.example](.hamstik-wheel.toml.example) shows an annotated
+configuration.
+
+### Run one Work Item
+
+```bash
 hamstik-wheel doctor
 hamstik-wheel once
 ```
 
-After you trust the behavior for individual Work Items:
+`doctor` verifies the whole dependency chain — Git, Pi, Hamstik CLI, the
+required Hamstik command surface, both configured models, and repository
+readiness — before any agent runs. `once` is the recommended way to establish
+trust: it selects the single highest-priority eligible Work Item, implements
+it, reviews it, commits, and closes it.
+
+### Run the wheel
 
 ```bash
 hamstik-wheel run --max-items 5
 ```
 
-For an unattended terminal session, tmux is sufficient:
+`run` repeats the same loop until the item limit is reached or no eligible
+Work Items remain. Omitting `--max-items` uses `[loop].max_items` from the
+configuration (10 by default).
 
-```bash
-tmux new -s hamstik-wheel
-hamstik-wheel run --max-items 10
+## Why Hamstik Wheel?
+
+![Why Hamstik Wheel?](assets/why-hamstik-wheel.png)
+
+- **Hamstik-native** — Hamstik CLI owns authentication, profile and context
+  resolution, API compatibility, Work Item access, comments, and lifecycle
+  transitions. Wheel holds no credentials and speaks no Hamstik HTTP.
+- **Two-model loop** — implementation and review run in separate fresh Pi
+  processes, each with its own configured model.
+- **Hard completion gates** — an agent saying "done" is not sufficient.
+  Repository validation and independent review must both pass before Wheel
+  commits and closes the Work Item.
+- **One Work Item at a time** — no fleets, worker pools, distributed
+  schedulers, or worktree concurrency. The design is deliberately narrow.
+- **Crash-safe and observable** — orchestration state lives under Git
+  metadata, and interrupted work resumes instead of silently starting
+  something new.
+
+## How it works
+
+![Hamstik Wheel workflow](assets/how-the-wheel-turns.png)
+
+```text
+Hamstik Work Item
+        ↓
+    Hamstik CLI
+        ↓
+ Pi implementation session
+        ↓
+  repository validation
+        ↓
+ fresh Pi review/remediation session
+        ↓
+  repository validation
+        ↓
+      git commit
+        ↓
+Hamstik Work Item → Done
+        ↓
+ next eligible Work Item
 ```
 
-Detach with `Ctrl-b d` and later reattach with:
+**Wheel — not the agent — owns lifecycle truth.** Implementation and reviewer
+agents never decide that a Work Item is Done, and both are explicitly
+instructed not to change Work Item status, add Hamstik comments, or create Git
+commits. Wheel advances the loop between phases, persists a phase marker after
+every step, and calls Hamstik CLI to start or close the Work Item only after
+the required gates succeed.
 
-```bash
-tmux attach -t hamstik-wheel
-```
+## Current capabilities
+
+Today Hamstik Wheel provides:
+
+- a project-local `.hamstik-wheel.toml` created by `init`;
+- deterministic, LLM-free Work Item selection with configured status, type,
+  and label filters;
+- Hamstik integration exclusively through machine-readable Hamstik CLI
+  surfaces, verified at runtime against the installed CLI's
+  `hamstik commands --json` manifest;
+- the `hamstik work context <KEY> --json` bundle as the authoritative agent
+  input;
+- separate implementation and review model configuration;
+- a fresh Pi process for every implementation and review session;
+- repository-defined validation commands, run before review and again after
+  review passes;
+- clean-working-tree protection before a new Work Item is selected
+  (`require_clean_start`);
+- a persisted baseline commit SHA for every active Work Item;
+- Git commits owned by Wheel — agents are forbidden from committing;
+- Work Item start/close transitions through Hamstik CLI;
+- start and completion comments with baseline-keyed idempotency, each
+  individually configurable;
+- crash/resume orchestration state under Git metadata
+  (`hamstik-wheel/state.json`);
+- per-Work-Item agent and validation logs under Git metadata;
+- `--max-items` and `max_review_cycles` loop limits;
+- `init`, `doctor`, `once`, `run`, `resume`, and `status`.
+
+Release packaging, a `docs/` tree, and multi-agent scale-out are future work;
+concurrency beyond one Work Item is a non-goal by design.
 
 ## Commands
 
-```text
-hamstik-wheel init                 Create .hamstik-wheel.toml
-hamstik-wheel doctor               Verify Git, Pi, Hamstik CLI, context, and config
-hamstik-wheel once                 Process one Work Item (or resume an interrupted one)
-hamstik-wheel run                  Process Work Items until the configured/requested limit
-hamstik-wheel resume               Resume the current interrupted Work Item
-hamstik-wheel status               Show persisted loop state
-```
+| Command | Purpose |
+| --- | --- |
+| `hamstik-wheel init` | Create `.hamstik-wheel.toml` in the current Git repository |
+| `hamstik-wheel doctor` | Verify Git, Pi, Hamstik CLI, its command surface, configured models, and repository readiness |
+| `hamstik-wheel once` | Process exactly one Work Item, resuming an active item first when needed |
+| `hamstik-wheel run --max-items N` | Process Work Items sequentially until the requested/configured limit or no work remains |
+| `hamstik-wheel resume` | Resume the interrupted active Work Item; errors when nothing is active |
+| `hamstik-wheel status` | Show persisted loop state: phase, Work Item, baseline SHA, review cycle, last error |
+
+`run` and `once` automatically resume an active Work Item before selecting a
+new one; `resume` exists for when that should be the only thing that happens.
+`--max-items` is optional and defaults to `[loop].max_items`.
 
 ## Configuration
 
-Wheel reads `.hamstik-wheel.toml` from the repository root. It deliberately does **not** contain Hamstik URLs or credentials; those belong to Hamstik CLI.
+Wheel reads `.hamstik-wheel.toml` from the repository root. It deliberately
+contains no Hamstik URL, PAT, refresh token, or authentication configuration —
+those belong to Hamstik CLI.
 
 ```toml
 [hamstik]
+# Path to the Hamstik CLI binary ("hamstik" via PATH when omitted).
+cli_path = "hamstik"
+# Candidate discovery is scoped to the Organization/Project selected by Hamstik CLI.
 statuses = ["todo"]
 item_types = ["task", "bug", "story", "feature"]
+# Optional extra eligibility gate, e.g. ["agent-ready"].
 label_names = []
 
 [models]
+# Any model identifier Pi can resolve is valid.
 implement = "step-3.7-flash"
 review = "glm-5.3-flash"
 
 [validation]
-commands = ["./scripts/do-prechecks.py"]
+# Commands run from the repository root; all must pass before completion.
+commands = [
+  "./scripts/do-prechecks.py",
+]
 
 [loop]
 max_items = 10
@@ -126,49 +229,193 @@ max_review_cycles = 3
 require_clean_start = true
 commit = true
 commit_message = "{key}: {title}"
+
+[comments]
+post_started = true
+post_completed = true
 ```
 
-Any model identifier Pi can resolve can be used. The defaults reflect the original local workflow but are not a Hamstik product requirement.
+- **`[hamstik]`** — how Wheel finds the CLI and which Work Items are eligible.
+  Statuses are restricted to `backlog`, `todo`, `in_progress`, `in_review`,
+  and `done`; types to `task`, `bug`, `story`, `feature`, and `epic`. Epics
+  are excluded by default because Wheel should execute actionable child work.
+- **`[models]`** — the two Pi models. Any model identifier Pi can resolve may
+  be configured; `step-3.7-flash` and `glm-5.3-flash` are the defaults from
+  the original local workflow, not requirements imposed by Hamstik.
+- **`[validation]`** — shell commands run from the repository root (`sh -lc`
+  on Unix, `cmd /C` on Windows); every command must exit 0. With no commands
+  configured, `doctor` warns that the final gate relies on review only.
+- **`[loop]`** — `max_items` bounds a `run` invocation when `--max-items` is
+  omitted; `max_review_cycles` bounds review/remediation iterations per Work
+  Item.
+- **`[git]`** — `require_clean_start` blocks new selection on a dirty working
+  tree; `commit` controls whether Wheel commits; `commit_message` supports the
+  `{key}` and `{title}` placeholders.
+- **`[comments]`** — post a comment when Wheel claims a Work Item and when it
+  completes it.
 
-## Selection policy
+## Work Item selection
 
-V1 intentionally avoids an AI planner. Candidate Work Items come from the current Hamstik CLI Project context and the configured status/type/label filters. Wheel then selects deterministically:
+Wheel intentionally does not use an LLM to decide what should be worked on
+next. Candidates are discovered with `hamstik work list --status … --type …
+--label-name … --all` inside the Organization/Project resolved by the Hamstik
+CLI context, then ordered deterministically:
 
 1. `in_progress` before backlog/todo when present in the candidate set;
-2. priority from highest to lowest;
+2. priority from highest to lowest (`urgent`/`critical`/`highest`, `high`,
+   `medium`/`normal`, `low`, `none`);
 3. oldest creation time first when priority is equal;
 4. Work Item key as a final stable tie-breaker.
 
-A repository can make eligibility stricter with the configured Hamstik CLI filters, for example `label_names = ["agent-ready"]`.
+A repository can make eligibility stricter with the configured filters, for
+example `label_names = ["agent-ready"]`. That label convention is an optional
+repository-side safeguard; Hamstik does not require it.
 
-## Agent contract
+## Implementation and review model
 
-The implementation agent receives the authoritative `hamstik work context <KEY> --json` bundle and the baseline Git SHA. It is told to implement the Work Item completely, add/update tests, avoid unrelated changes, and return a structured final marker.
+```text
+Work Item
+   │
+   ├── fresh Pi implementer
+   │      model = [models].implement
+   │
+   └── fresh Pi reviewer/remediator
+          model = [models].review
+```
 
-The reviewer runs as a **fresh Pi process**. It independently inspects the authoritative Work Item, repository, baseline diff, and pre-review validation evidence. It may modify the working tree to resolve findings. Wheel accepts completion only when the reviewer reports PASS and all configured validation commands pass.
+The implementation agent receives the authoritative
+`hamstik work context <KEY> --json` bundle and the baseline Git SHA. It is
+instructed to inspect the repository first, implement the Work Item
+completely, add or update tests, keep changes scoped to the Work Item, and
+continue any partial working-tree changes on a resumed run. It ends with a
+structured `HAMSTIK_WHEEL_RESULT` marker reporting `ready_for_review` or
+`blocked`.
 
-Agents do not call `hamstik work close`; Wheel owns Work Item lifecycle transitions.
+The reviewer runs as a **fresh Pi process** with no shared conversation. The
+reviewer independently inspects the Work Item, the Git diff against the
+baseline, the repository architecture, tests, and acceptance criteria, plus
+the pre-review validation evidence — rather than inheriting the implementer's
+assumptions. It is authorized to edit the working tree to fix findings, and it
+also ends with a structured marker: `pass` with zero findings, or `blocked`.
+
+Wheel parses only the final structured marker from each session; it does not
+read or interpret model reasoning.
+
+## Completion gates
+
+Successful completion is defined by the gates Wheel controls, not by an
+agent's self-report:
+
+```text
+implementation complete
+       ↓
+pre-review validation passes
+       ↓
+independent review returns PASS (zero findings)
+       ↓
+remediation, if the reviewer reported findings
+       ↓
+final validation passes
+       ↓
+git commit succeeds
+       ↓
+Hamstik close succeeds
+```
+
+All configured validation commands must exit 0 before review and again after
+the review passes. A reviewer `pass` that still reports findings is treated as
+a failure and fed into the next review cycle, as is a failed final validation.
+Review/remediation repeats up to `max_review_cycles`; if the loop never
+converges, Wheel stops with an error, leaves the Work Item open, and keeps its
+state persisted for inspection or `resume`.
+
+When the gates pass, Wheel commits with `git add -A` and the configured
+message template, records the commit SHA, and asks Hamstik CLI to close the
+Work Item. With `commit = false`, Wheel closes the item and reports that the
+changes were intentionally left uncommitted.
 
 ## Crash recovery
 
-Wheel stores state using `git rev-parse --git-path hamstik-wheel/state.json`. This keeps orchestration state inside Git metadata rather than the working tree. If a machine or terminal dies mid-item:
+Wheel stores state using `git rev-parse --git-path
+hamstik-wheel/state.json`, so orchestration state lives inside Git metadata
+rather than the working tree: it never dirties the repository, is never
+committed, and is resolved per worktree. Writes are atomic (temporary file +
+rename), and agent output and validation evidence are captured under the same
+metadata tree (`hamstik-wheel/logs/<KEY>/`).
+
+If a machine or terminal dies mid-item:
 
 ```bash
-hamstik-wheel resume
+hamstik-wheel status    # persisted phase, Work Item, baseline, review cycle, last error
+hamstik-wheel resume    # continue the interrupted Work Item from its persisted phase
 ```
 
-Wheel resumes the persisted phase instead of selecting a new Work Item.
+Resumed runs re-read the authoritative Work Item context so agent input stays
+current. While an item's orchestration state is active, Wheel does not select
+a new Work Item — `once` and `run` resume the active item first.
+
+## Running unattended
+
+tmux is deliberately optional:
+
+```bash
+tmux new -s hamstik-wheel
+hamstik-wheel run --max-items 10
+```
+
+Detach with `Ctrl-b d` and reattach later with `tmux attach -t hamstik-wheel`.
+
+tmux is only a durable terminal/session host. It is not part of Hamstik
+Wheel's orchestration architecture — Wheel itself is a plain foreground
+process, and its durable state lives in Git metadata.
+
+## Relationship to Hamstik CLI
+
+Wheel treats the installed `hamstik` binary as a local machine API
+([ADR-0001](design/ADR-0001-hamstik-cli-boundary.md)) and invokes only
+machine-facing commands, always with the global `--no-input --json` flags:
+
+```text
+hamstik doctor                       # dependency diagnostics before any agent runs
+hamstik commands                     # manifest check for the required command surface
+hamstik work list …                  # candidate discovery with configured filters
+hamstik work context <KEY>           # authoritative agent input
+hamstik work start <KEY>             # claim the Work Item
+hamstik work comment add <KEY>       # start/completion comments (idempotency-keyed)
+hamstik work close <KEY>             # close after all gates pass
+```
+
+Before any unattended run, Wheel verifies through `hamstik commands --json`
+that the installed CLI provides every required command and advertises
+`--json` and `--no-input` support for it.
+
+Wheel intentionally does not contain Hamstik HTTP/API client code, PAT/token
+persistence, profile handling, URL/server configuration, API compatibility or
+model refresh logic, or duplicated Hamstik workflow semantics. Those
+responsibilities remain in hamstik-cli, so authentication, context resolution,
+retries, and redaction behave identically for manual and automated use.
 
 ## Design documents
 
-Internal product/design artifacts live under [`design/`](design/):
+The detailed product and technical direction lives under
+[`design/`](design/):
 
-- [`PRD.md`](design/PRD.md)
-- [`SPEC.md`](design/SPEC.md)
-- [`ADR-0001-hamstik-cli-boundary.md`](design/ADR-0001-hamstik-cli-boundary.md)
+- [`design/PRD.md`](design/PRD.md) — product requirements
+- [`design/SPEC.md`](design/SPEC.md) — technical specification
+- [`design/ADR-0001-hamstik-cli-boundary.md`](design/ADR-0001-hamstik-cli-boundary.md)
+  — why Hamstik CLI is the sole Hamstik integration boundary
 
-User-facing documentation should remain outside `design/` as the project grows.
+`design/` holds internal product/architecture artifacts; user-facing
+documentation belongs in this README or a future `docs/` tree.
+
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-Apache License 2.0. See [`LICENSE`](LICENSE).
+Hamstik Wheel is open-source software licensed under [Apache-2.0](LICENSE).
+
+## Trademark
+
+Hamstik and the Hamstik logo are trademarks of Blackboard Studios.
