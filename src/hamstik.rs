@@ -202,7 +202,7 @@ fn compare_optional_created_at(a: &Option<String>, b: &Option<String>) -> Orderi
 }
 
 fn normalize(s: &str) -> String {
-    s.trim().to_ascii_lowercase().replace('-', "_").replace(' ', "_")
+    s.trim().to_ascii_lowercase().replace(['-', ' '], "_")
 }
 
 fn status_rank(status: &str) -> u8 {

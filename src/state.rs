@@ -126,9 +126,11 @@ mod tests {
     fn state_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::new(dir.path().join("state.json"));
-        let mut state = WheelState::default();
-        state.phase = Phase::Selected;
-        state.current = Some(ActiveWorkItem { key: "HAM-1".into(), title: "One".into(), baseline_sha: "abc".into(), commit_sha: None });
+        let mut state = WheelState {
+            phase: Phase::Selected,
+            current: Some(ActiveWorkItem { key: "HAM-1".into(), title: "One".into(), baseline_sha: "abc".into(), commit_sha: None }),
+            ..WheelState::default()
+        };
         store.save(&mut state).unwrap();
         let loaded = store.load().unwrap();
         assert_eq!(loaded.phase, Phase::Selected);

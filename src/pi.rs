@@ -3,7 +3,7 @@
 
 use std::{io::{BufRead, BufReader, Write}, path::Path, process::{Command, Stdio}};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -18,6 +18,14 @@ pub struct AgentResult {
     pub findings: Vec<String>,
 }
 
+/// Outcome of one Pi invocation. The transcript is always captured so callers can
+/// persist it even when the agent failed to emit a parsable result marker.
+#[derive(Debug)]
+pub struct PiRun {
+    pub result: Result<AgentResult>,
+    pub transcript: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct PiRunner {
     repo_root: std::path::PathBuf,
@@ -28,7 +36,7 @@ impl PiRunner {
         Self { repo_root: repo_root.to_path_buf() }
     }
 
-    pub fn run(&self, model: &str, prompt: &str) -> Result<(AgentResult, String)> {
+    pub fn run(&self, model: &str, prompt: &str) -> Result<PiRun> {
         let mut child = Command::new("pi")
             .current_dir(&self.repo_root)
             .args(["--model", model, "--no-session", "-p", "Execute the Hamstik Wheel task supplied on stdin."])
@@ -38,26 +46,45 @@ impl PiRunner {
             .spawn()
             .with_context(|| format!("failed to start Pi with model {model}"))?;
 
-        child.stdin.as_mut().context("failed to open Pi stdin")?.write_all(prompt.as_bytes())?;
+        let write_error = match child
+            .stdin
+            .as_mut()
+            .context("failed to open Pi stdin")?
+            .write_all(prompt.as_bytes())
+        {
+            Ok(()) => None,
+            Err(error) => Some(anyhow!("failed writing prompt to Pi stdin: {error}")),
+        };
         drop(child.stdin.take());
 
         let stdout = child.stdout.take().context("failed to open Pi stdout")?;
         let reader = BufReader::new(stdout);
-        let mut captured = String::new();
+        let mut transcript = String::new();
+        let mut read_error = None;
         for line in reader.lines() {
-            let line = line?;
-            println!("{line}");
-            captured.push_str(&line);
-            captured.push('\n');
+            match line {
+                Ok(line) => {
+                    println!("{line}");
+                    transcript.push_str(&line);
+                    transcript.push('\n');
+                }
+                Err(error) => {
+                    read_error = Some(anyhow!("failed reading Pi stdout: {error}"));
+                    break;
+                }
+            }
         }
 
         let status = child.wait().context("failed waiting for Pi")?;
-        if !status.success() {
-            bail!("Pi model {model} exited with status {:?}", status.code());
-        }
+        let result = if let Some(error) = write_error.or(read_error) {
+            Err(error)
+        } else if !status.success() {
+            Err(anyhow!("Pi model {model} exited with status {:?}", status.code()))
+        } else {
+            parse_agent_result(&transcript)
+        };
 
-        let result = parse_agent_result(&captured)?;
-        Ok((result, captured))
+        Ok(PiRun { result, transcript })
     }
 }
 
@@ -143,7 +170,10 @@ pub fn parse_agent_result(output: &str) -> Result<AgentResult> {
     let marker = output
         .lines()
         .rev()
-        .find_map(|line| line.trim().strip_prefix(RESULT_PREFIX))
+        .find_map(|line| {
+            let start = line.find(RESULT_PREFIX)? + RESULT_PREFIX.len();
+            Some(line[start..].trim())
+        })
         .context("Pi output did not contain HAMSTIK_WHEEL_RESULT marker")?;
     let parsed: AgentResult = serde_json::from_str(marker).context("HAMSTIK_WHEEL_RESULT contained invalid JSON")?;
     if parsed.status.trim().is_empty() {
@@ -167,5 +197,18 @@ mod tests {
     #[test]
     fn rejects_missing_marker() {
         assert!(parse_agent_result("done").is_err());
+    }
+
+    #[test]
+    fn parses_marker_prefixed_by_bullet() {
+        let output = "summary\n- HAMSTIK_WHEEL_RESULT={\"status\":\"ready_for_review\",\"summary\":\"done\",\"findings\":[]}\n";
+        let result = parse_agent_result(output).unwrap();
+        assert_eq!(result.status, "ready_for_review");
+    }
+
+    #[test]
+    fn rejects_malformed_marker_json() {
+        let output = "HAMSTIK_WHEEL_RESULT={not json}\n";
+        assert!(parse_agent_result(output).is_err());
     }
 }

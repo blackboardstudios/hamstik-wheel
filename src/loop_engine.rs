@@ -91,6 +91,7 @@ impl LoopEngine {
     pub fn status(&self) -> Result<()> {
         let state = self.store.load()?;
         println!("State file: {}", self.store.path().display());
+        println!("Logs: {}", self.logs_root.display());
         println!("Phase: {:?}", state.phase);
         if let Some(item) = state.current.as_ref() {
             println!("Work Item: {} — {}", item.key, item.title);
@@ -223,8 +224,15 @@ impl LoopEngine {
             self.store.save(state)?;
             println!("\n[implement] {} with {}", current.key, self.config.models.implement);
             let prompt = implementation_prompt(&current.key, &current.title, &current.baseline_sha, &context);
-            let (result, output) = self.pi.run(&self.config.models.implement, &prompt)?;
-            self.write_log(&current.key, "implement.log", &output)?;
+            let run = self.pi.run(&self.config.models.implement, &prompt)?;
+            self.write_log(&current.key, "implement.log", &run.transcript)?;
+            let result = run.result.with_context(|| {
+                format!(
+                    "implementation agent failed; transcript: '{}'; state preserved, run `hamstik-wheel resume` to continue {}",
+                    self.log_path(&current.key, "implement.log").display(),
+                    current.key
+                )
+            })?;
             match result.status.as_str() {
                 "ready_for_review" => {}
                 "blocked" => bail!("implementation blocked: {}", result.summary),
@@ -260,8 +268,16 @@ impl LoopEngine {
                     &evidence,
                     cycle,
                 );
-                let (review, output) = self.pi.run(&self.config.models.review, &prompt)?;
-                self.write_log(&current.key, &format!("review-{cycle:02}.log"), &output)?;
+                let run = self.pi.run(&self.config.models.review, &prompt)?;
+                let review_log = format!("review-{cycle:02}.log");
+                self.write_log(&current.key, &review_log, &run.transcript)?;
+                let review = run.result.with_context(|| {
+                    format!(
+                        "review agent failed (cycle {cycle}); transcript: '{}'; state preserved, run `hamstik-wheel resume` to continue {}",
+                        self.log_path(&current.key, &review_log).display(),
+                        current.key
+                    )
+                })?;
                 if review.status == "blocked" {
                     bail!("review blocked: {}", review.summary);
                 }
@@ -358,10 +374,14 @@ impl LoopEngine {
         bail!("unexpected terminal phase {:?} for {}", state.phase, current.key)
     }
 
+    fn log_path(&self, key: &str, name: &str) -> PathBuf {
+        self.logs_root.join(sanitize_component(key)).join(name)
+    }
+
     fn write_log(&self, key: &str, name: &str, content: &str) -> Result<()> {
-        let dir = self.logs_root.join(sanitize_component(key));
-        fs::create_dir_all(&dir)?;
-        fs::write(dir.join(name), content)?;
+        let path = self.log_path(key, name);
+        fs::create_dir_all(path.parent().context("log path has no parent directory")?)?;
+        fs::write(path, content)?;
         Ok(())
     }
 }
