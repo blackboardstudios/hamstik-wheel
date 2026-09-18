@@ -77,8 +77,9 @@ impl ActivityTracker {
             return;
         }
         let final_line = format!("[pi] ✓ finished · {}", format_elapsed(self.elapsed()));
-        // Overwrite whatever partial frame is on screen, then keep the summary.
-        print!("\r{final_line}\n");
+        // Pad like render_loop frames so a shorter final line fully erases
+        // the last partial frame on screen.
+        print!("\r{final_line:<80}\n");
         let _ = std::io::stdout().flush();
     }
 }

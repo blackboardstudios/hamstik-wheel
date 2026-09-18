@@ -219,13 +219,15 @@ impl LoopEngine {
         self.hamstik.doctor()?;
         if !check_pi_model(&self.config.models.implement) {
             bail!(
-                "Pi could not resolve implementation model `{}`",
+                "Pi could not resolve implementation model `{}`. If it is ambiguous across providers, set the config value to a provider-qualified id like `provider/model` (run `pi --list-models {}` to see matches).",
+                self.config.models.implement,
                 self.config.models.implement
             );
         }
         if !check_pi_model(&self.config.models.review) {
             bail!(
-                "Pi could not resolve review model `{}`",
+                "Pi could not resolve review model `{}`. If it is ambiguous across providers, set the config value to a provider-qualified id like `provider/model` (run `pi --list-models {}` to see matches).",
+                self.config.models.review,
                 self.config.models.review
             );
         }
@@ -589,16 +591,27 @@ fn check_process(logger: &Logger, name: &str, args: &[&str]) -> bool {
     }
 }
 
+/// Verify Pi can resolve a model id to exactly one provider/model pair, the
+/// way Wheel's agent invocations will. Uses a short real invocation (the
+/// cheapest reliable signal: bare patterns ambiguous across authenticated
+/// providers and unresolvable ids both fail at startup, before any request).
 fn check_pi_model(model: &str) -> bool {
-    match Command::new("pi").args(["--list-models", model]).output() {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            !stdout.trim().is_empty()
-                && stdout
-                    .to_ascii_lowercase()
-                    .contains(&model.to_ascii_lowercase())
-        }
-        _ => false,
+    use std::io::Write;
+    let Ok(mut child) = Command::new("pi")
+        .args(["--model", model, "--no-session", "--mode", "json", "-p"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    // An empty prompt resolves instantly at startup; any response is harmless.
+    let _ = child.stdin.as_mut().map(|stdin| stdin.write_all(b""));
+    drop(child.stdin.take());
+    match child.wait() {
+        Ok(status) => status.success(),
+        Err(_) => false,
     }
 }
 

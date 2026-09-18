@@ -14,7 +14,9 @@ item_types = ["task", "bug", "story", "feature"]
 label_names = []
 
 [models]
-# Any model identifier/pattern Pi can resolve is valid.
+# Any model identifier/pattern Pi can resolve is valid. If a bare pattern
+# matches multiple authenticated providers, use a provider-qualified id
+# like "provider/model" (check with: pi --list-models <pattern>).
 implement = "step-3.7-flash"
 review = "glm-5.3-flash"
 
