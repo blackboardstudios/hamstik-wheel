@@ -125,6 +125,14 @@ impl StateStore {
         state.last_error = None;
         self.save(state)
     }
+
+    /// Reset the per-run completion counter at the start of a `run`
+    /// invocation so `status` reflects the current run, not an accumulation
+    /// across runs.
+    pub fn begin_run(&self, state: &mut WheelState) -> Result<()> {
+        state.completed_this_run = 0;
+        self.save(state)
+    }
 }
 
 #[cfg(test)]

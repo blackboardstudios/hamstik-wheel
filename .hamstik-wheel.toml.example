@@ -33,7 +33,7 @@ max_review_cycles = 3
 # with the next Work Item. "halt": stop the run on the first failure (default).
 on_failure = "halt"
 # Wall-clock cap for each agent session, in minutes. 0 disables the cap.
-agent_timeout_minutes = 90
+agent_timeout_minutes = 105
 # Retry the implementation session once when the first attempt fails to
 # produce a parsable result marker.
 implement_retry = false

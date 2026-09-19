@@ -174,6 +174,11 @@ impl LoopEngine {
             bail!("max-items must be greater than zero");
         }
 
+        // Per-run counter: reset at run start so `status` shows this run's
+        // completions, not an accumulation across invocations.
+        let mut state = self.store.load()?;
+        self.store.begin_run(&mut state)?;
+
         let mut completed = 0usize;
         let mut skipped = 0usize;
         let mut last_skipped_key: Option<String> = None;

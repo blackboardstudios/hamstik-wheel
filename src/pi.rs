@@ -180,7 +180,7 @@ Your responsibilities:
 3. Add or update tests for changed behavior where appropriate.
 4. Run useful repository checks during implementation. Your session has a hard wall-clock limit: prefer targeted checks (`cargo check -p <crate>`) over the full precheck suite — Hamstik Wheel runs full validation after implementation.
 5. Keep changes scoped to this Work Item; do not rewrite unrelated behavior merely to make the task easier.
-6. Inspect any existing partial working-tree changes and continue them safely if this is a resumed run. A previous session's partial work may exist on a `wheel/wip/<KEY>` branch; inspect it with `git log wheel/wip/{key}` and reuse what is salvageable.
+6. Inspect any existing partial working-tree changes and continue them safely if this is a resumed run. A previous session's partial work may exist on a `wheel/wip/{key}` branch: inspect it read-only (`git log wheel/wip/{key}`, `git diff {baseline} wheel/wip/{key}`) and copy what is salvageable into your working tree. NEVER merge, checkout, rebase, or otherwise move branch refs — those are Hamstik Wheel's to manage.
 7. Do NOT change the Hamstik Work Item status, add Hamstik comments, or close the Work Item. Hamstik Wheel owns lifecycle.
 8. Do NOT create a Git commit. Leave the complete implementation in the working tree for independent review.
 9. If requirements are materially ambiguous/conflicting or safe completion is impossible, stop without inventing requirements.
@@ -234,9 +234,10 @@ Review for at least:
 
 You are authorized to edit the working tree to fix every actionable finding. After fixes, review the resulting diff again. Continue until there are zero unresolved actionable findings or you determine safe completion is blocked.
 
-Work within a strict time budget — your session has a hard wall-clock limit and a previous review was killed mid-remediation after 45 minutes. Therefore:
+Work within a strict time budget — your session has a hard wall-clock limit and a previous review was killed mid-remediation. Therefore:
 - Inspect `git diff {baseline}` first; read only files the diff touches.
-- Do NOT run the repository's full precheck script or the whole test suite; Hamstik Wheel runs full validation itself after your review. For quick feedback use targeted checks only (e.g. `cargo check -p <touched-crate> --all-targets`), at most a handful of times.
+- Do NOT run full-repository verification: never run precheck scripts, `cargo fmt --all`, `cargo clippy --workspace`, `cargo build --workspace --release`, or the whole test suite. Hamstik Wheel already ran full validation after implementation (see evidence below) and runs it again after your review. If a check you need would take the whole workspace, skip it and note it in your summary instead.
+- Use targeted checks only, at most 3 times total: `cargo check -p <touched-crate> --all-targets` or `cargo test -p <touched-crate> --test <relevant-test>`.
 - Prefer small, decisive fixes over exploratory loops. When you are more than halfway through your budget, stop fixing and emit the marker.
 
 Do NOT change Hamstik Work Item status/comments and do NOT create a Git commit. Hamstik Wheel owns those actions.
