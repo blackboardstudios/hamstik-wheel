@@ -63,7 +63,10 @@ impl LoopEngine {
         failed |= !check_process(&self.logger, "pi", &["--version"]);
         failed |= !check_process(&self.logger, &self.config.hamstik.cli_path, &["--version"]);
 
-        match self.hamstik.verify_required_commands() {
+        match self
+            .hamstik
+            .verify_required_commands(self.config.hamstik.assign_to_me)
+        {
             Ok(()) => self
                 .logger
                 .info("✓ Hamstik CLI command manifest supports Wheel requirements"),
@@ -253,7 +256,8 @@ impl LoopEngine {
     fn preflight(&self) -> Result<()> {
         require_process("pi", &["--version"])?;
         require_process(&self.config.hamstik.cli_path, &["--version"])?;
-        self.hamstik.verify_required_commands()?;
+        self.hamstik
+            .verify_required_commands(self.config.hamstik.assign_to_me)?;
         self.hamstik.doctor()?;
         if !check_pi_model(&self.config.models.implement) {
             bail!(
@@ -379,6 +383,9 @@ impl LoopEngine {
         if state.phase == Phase::Selected {
             self.logger.info(&format!("[claim] {}", current.key));
             self.hamstik.start(&current.key)?;
+            if self.config.hamstik.assign_to_me {
+                self.hamstik.assign_to_me(&current.key)?;
+            }
             if self.config.comments.post_started {
                 let body = format!(
                     "Hamstik Wheel started automated implementation.\n\n- Baseline: `{}`\n- Implementation model: `{}`\n- Review model: `{}`",

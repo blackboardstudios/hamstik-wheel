@@ -56,6 +56,7 @@ Example:
 statuses = ["todo"]
 item_types = ["task", "bug", "story", "feature"]
 label_names = []
+assign_to_me = true
 
 [models]
 implement = "step-3.7-flash"
@@ -128,6 +129,13 @@ The entire returned JSON object is preserved and passed to agents. Wheel should 
 
 ```bash
 hamstik --no-input --json work start HAM-123
+```
+
+When assignment is enabled, Wheel then assigns the Work Item to the authenticated
+Hamstik user:
+
+```bash
+hamstik --no-input --json work edit HAM-123 --assignee me
 ```
 
 #### Add comment

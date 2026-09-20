@@ -266,6 +266,8 @@ statuses = ["todo"]
 item_types = ["task", "bug", "story", "feature"]
 # Optional extra eligibility gate, e.g. ["agent-ready"].
 label_names = []
+# Assign each claimed Work Item to the authenticated Hamstik user.
+assign_to_me = true
 
 [models]
 # Any model identifier Pi can resolve is valid.
@@ -295,7 +297,10 @@ post_started = true
 post_completed = true
 ```
 
-- **`[hamstik]`** — how Wheel finds the CLI and which Work Items are eligible.
+- **`[hamstik]`** — how Wheel finds the CLI, which Work Items are eligible, and
+  whether claimed Work Items are assigned to the authenticated Hamstik user.
+  `assign_to_me` defaults to `true`; set it to `false` to leave assignees
+  unchanged.
   Statuses are restricted to `backlog`, `todo`, `in_progress`, `in_review`,
   and `done`; types to `task`, `bug`, `story`, `feature`, and `epic`. Epics
   are excluded by default because Wheel should execute actionable child work.

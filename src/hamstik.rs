@@ -107,8 +107,8 @@ impl HamstikCli {
         self.run_json(&["commands"])
     }
 
-    pub fn verify_required_commands(&self) -> Result<()> {
-        const REQUIRED: &[&str] = &[
+    pub fn verify_required_commands(&self, require_assignment: bool) -> Result<()> {
+        let mut required = vec![
             "hamstik doctor",
             "hamstik commands",
             "hamstik work list",
@@ -118,6 +118,9 @@ impl HamstikCli {
             "hamstik work transition",
             "hamstik work comment add",
         ];
+        if require_assignment {
+            required.push("hamstik work edit");
+        }
 
         let manifest = self.command_manifest()?;
         let commands = manifest
@@ -125,10 +128,10 @@ impl HamstikCli {
             .and_then(Value::as_array)
             .context("hamstik command manifest is missing commands[]")?;
 
-        for required in REQUIRED {
+        for required in required {
             let entry = commands
                 .iter()
-                .find(|entry| entry.get("command").and_then(Value::as_str) == Some(*required));
+                .find(|entry| entry.get("command").and_then(Value::as_str) == Some(required));
             let Some(entry) = entry else {
                 bail!("installed hamstik CLI does not provide required command `{required}`");
             };
@@ -188,6 +191,10 @@ impl HamstikCli {
         self.run_json(&["work", "start", key])
     }
 
+    pub fn assign_to_me(&self, key: &str) -> Result<Value> {
+        self.run_json_owned(&assign_to_me_args(key))
+    }
+
     pub fn close(&self, key: &str) -> Result<Value> {
         self.run_json(&["work", "close", key])
     }
@@ -243,6 +250,16 @@ impl HamstikCli {
         serde_json::from_slice(&output.stdout)
             .context("hamstik comment command did not return valid JSON")
     }
+}
+
+fn assign_to_me_args(key: &str) -> Vec<String> {
+    vec![
+        "work".to_string(),
+        "edit".to_string(),
+        key.to_string(),
+        "--assignee".to_string(),
+        "me".to_string(),
+    ]
 }
 
 pub fn select_next(mut items: Vec<WorkItemSummary>) -> Option<WorkItemSummary> {
@@ -392,5 +409,13 @@ mod tests {
             },
         ];
         assert_eq!(select_next(items).unwrap().key, "HAM-2");
+    }
+
+    #[test]
+    fn assignment_targets_authenticated_user() {
+        assert_eq!(
+            assign_to_me_args("HAM-42"),
+            vec!["work", "edit", "HAM-42", "--assignee", "me"]
+        );
     }
 }

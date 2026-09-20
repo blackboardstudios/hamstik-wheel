@@ -29,6 +29,8 @@ pub struct HamstikConfig {
     pub statuses: Vec<String>,
     pub item_types: Vec<String>,
     pub label_names: Vec<String>,
+    /// Assign each claimed Work Item to the authenticated Hamstik user.
+    pub assign_to_me: bool,
 }
 
 impl Default for HamstikConfig {
@@ -43,6 +45,7 @@ impl Default for HamstikConfig {
                 "feature".to_string(),
             ],
             label_names: Vec::new(),
+            assign_to_me: true,
         }
     }
 }
@@ -217,6 +220,7 @@ mod tests {
         assert_eq!(c.models.review, "glm-5.3-flash");
         assert_eq!(c.hamstik.statuses, vec!["todo"]);
         assert!(!c.hamstik.item_types.contains(&"epic".to_string()));
+        assert!(c.hamstik.assign_to_me);
     }
 
     #[test]
@@ -224,6 +228,13 @@ mod tests {
         let raw = toml::to_string(&Config::default()).unwrap();
         let parsed: Config = toml::from_str(&raw).unwrap();
         parsed.validate().unwrap();
+    }
+
+    #[test]
+    fn assignment_can_be_disabled() {
+        let parsed: Config = toml::from_str("[hamstik]\nassign_to_me = false\n").unwrap();
+        parsed.validate().unwrap();
+        assert!(!parsed.hamstik.assign_to_me);
     }
 
     #[test]

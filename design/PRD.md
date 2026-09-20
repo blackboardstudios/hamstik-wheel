@@ -120,6 +120,7 @@ The configuration MUST support at least:
 - implementation model;
 - review model;
 - validation command list;
+- assignment of claimed Work Items to the authenticated Hamstik user;
 - maximum Work Items per run;
 - maximum review cycles;
 - clean-start requirement;
@@ -160,6 +161,8 @@ Wheel SHOULD permit projects to restrict eligibility with configured `work list`
 ### FR-4 — Claim/start
 
 Before implementation begins, Wheel MUST retrieve authoritative Work Item context and request `hamstik work start <KEY>` when the Work Item is not already in progress.
+
+Wheel MUST support configuration to assign the Work Item to the authenticated Hamstik user when it is claimed; this setting defaults to enabled.
 
 When enabled, Wheel SHOULD add a concise comment identifying the automated run, implementation model, review model, and baseline Git SHA.
 
