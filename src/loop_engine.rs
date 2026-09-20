@@ -557,6 +557,15 @@ impl LoopEngine {
                 // a clean tree with HEAD advanced from the baseline is the conservative
                 // recovery signal for the Wheel-created commit.
                 self.repo.head()?
+            } else if self.repo.is_clean()? {
+                // A clean tree at the baseline means nothing was implemented;
+                // git commit would fail with "nothing to commit" (observed:
+                // misparsed agent results let an unimplemented item through).
+                bail!(
+                    "working tree is clean at baseline {}; nothing to commit for {key}; item was not implemented",
+                    current.baseline_sha,
+                    key = current.key,
+                );
             } else {
                 let message = GitRepo::expand_commit_message(
                     &self.config.git.commit_message,
@@ -658,12 +667,15 @@ impl LoopEngine {
     fn run_implement_session(&self, key: &str, prompt: &str) -> Result<crate::pi::PiRun> {
         let mut run = self.run_agent(&self.config.models.implement, prompt)?;
         if run.result.is_err() && self.config.r#loop.implement_retry {
-            let retry_log = "implement-retry.log";
+            // Persist the first attempt under its own name BEFORE the retry,
+            // so the caller's implement.log write cannot overwrite it (the
+            // final run may be the retry, and the first transcript is
+            // otherwise lost - observed on CLI-54 and CLI-9).
+            self.write_log(key, "implement-attempt-01.log", &run.transcript)?;
             self.logger.warn(&format!(
                 "[implement] {key}: first session did not produce a parsable result; retrying once"
             ));
             let retry = self.run_agent(&self.config.models.implement, prompt)?;
-            self.write_log(key, retry_log, &retry.transcript)?;
             if retry.result.is_ok() {
                 run = retry;
             } else {

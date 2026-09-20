@@ -91,10 +91,21 @@ impl GitRepo {
             .output()
             .context("failed to execute git commit")?;
         if !commit.status.success() {
-            bail!(
-                "git commit failed: {}",
-                String::from_utf8_lossy(&commit.stderr).trim()
-            );
+            // git writes "nothing to commit, working tree clean" and other
+            // commit failures to stdout, so include both streams (observed:
+            // an empty message because the explanation was on stdout).
+            let stderr = String::from_utf8_lossy(&commit.stderr).into_owned();
+            let stdout = String::from_utf8_lossy(&commit.stdout).into_owned();
+            let stderr = stderr.trim();
+            let stdout = stdout.trim();
+            let detail = if stderr.is_empty() {
+                stdout.to_string()
+            } else if stdout.is_empty() {
+                stderr.to_string()
+            } else {
+                format!("{stderr}; stdout: {stdout}")
+            };
+            bail!("git commit failed: {detail}");
         }
         self.head()
     }
@@ -143,7 +154,17 @@ impl GitRepo {
         if self.is_clean()? {
             return Ok(None);
         }
-        let branch = format!("wheel/wip/{}", sanitize_ref_component(key));
+        // A branch from an earlier skip of the same key may already exist
+        // (observed: a timed-out review after a prior skip left
+        // `wheel/wip/CLI-32` in place); append a numeric suffix instead of
+        // failing the preservation run.
+        let base = sanitize_ref_component(key);
+        let mut branch = format!("wheel/wip/{base}");
+        let mut suffix = 1usize;
+        while self.ref_exists(&branch) {
+            suffix += 1;
+            branch = format!("wheel/wip/{base}-{suffix}");
+        }
 
         let add = Command::new("git")
             .current_dir(&self.root)
@@ -164,10 +185,18 @@ impl GitRepo {
             .output()
             .context("failed to execute git commit for WIP preservation")?;
         if !commit.status.success() {
-            bail!(
-                "git commit failed during WIP preservation: {}",
-                String::from_utf8_lossy(&commit.stderr).trim()
-            );
+            let stderr = String::from_utf8_lossy(&commit.stderr).into_owned();
+            let stdout = String::from_utf8_lossy(&commit.stdout).into_owned();
+            let stderr = stderr.trim();
+            let stdout = stdout.trim();
+            let detail = if stderr.is_empty() {
+                stdout.to_string()
+            } else if stdout.is_empty() {
+                stderr.to_string()
+            } else {
+                format!("{stderr}; stdout: {stdout}")
+            };
+            bail!("git commit failed during WIP preservation: {detail}");
         }
         let wip_sha = self.head()?;
 
@@ -188,6 +217,21 @@ impl GitRepo {
 
         self.checkout_baseline(_baseline_sha)?;
         Ok(Some(branch))
+    }
+
+    /// Whether a Git ref (branch or tag) with this exact name exists.
+    fn ref_exists(&self, ref_name: &str) -> bool {
+        Command::new("git")
+            .current_dir(&self.root)
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{ref_name}^{{commit}}"),
+            ])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     }
 }
 

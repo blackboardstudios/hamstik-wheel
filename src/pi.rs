@@ -268,57 +268,106 @@ pub fn parse_agent_result(output: &str) -> Result<AgentResult> {
     Ok(parsed)
 }
 
-/// Find the marker payload anywhere in the transcript. Handles both a plain
-/// line occurrence and a JSON-escaped occurrence inside an NDJSON event line
-/// by parsing the line and searching every decoded string value, which
-/// sidesteps escape-state tracking entirely.
+/// Find the marker payload in the transcript. Handles both a plain line
+/// occurrence and a JSON-escaped occurrence inside an NDJSON event line by
+/// parsing the line and searching assistant message text, which sidesteps
+/// escape-state tracking entirely.
+///
+/// Only assistant message content is searched. Prompt text (system/user
+/// roles) carries example markers that must never be accepted as the
+/// agent's verdict (observed: the prompt examples embedded in an
+/// `agent_end` event were matched instead of a reviewer's real `blocked`
+/// verdict, letting an unimplemented item reach the commit phase).
 fn find_marker_line(output: &str) -> Result<String> {
     for line in output.lines().rev() {
         let Some(start) = line.find(RESULT_PREFIX) else {
             continue;
         };
         let rest = &line[start + RESULT_PREFIX.len()..];
-        let trimmed = rest.trim();
+
         // Plain (unescaped) occurrence: the marker JSON directly on the line.
+        let trimmed = rest.trim();
         if trimmed.starts_with('{') && serde_json::from_str::<Value>(trimmed).is_ok() {
+            if is_placeholder_marker(trimmed) {
+                continue;
+            }
             return Ok(trimmed.to_string());
         }
+
         // Escaped occurrence inside an event line: decode the line as JSON
-        // and search its string values for the marker payload.
+        // and search assistant message text values for the marker payload.
         if let Ok(value) = serde_json::from_str::<Value>(line) {
-            let mut found = None;
-            search_strings(&value, &mut |text| {
-                if found.is_none() {
-                    if let Some(payload) = marker_payload_in(text) {
-                        found = Some(payload);
+            let mut texts = Vec::new();
+            collect_assistant_texts(&value, &mut texts);
+            for text in texts.iter().rev() {
+                if let Some(payload) = last_marker_payload_in(text) {
+                    if !is_placeholder_marker(&payload) {
+                        return Ok(payload);
                     }
                 }
-            });
-            if let Some(payload) = found {
+            }
+            continue;
+        }
+
+        // Fallback heuristic for lines that are neither plain markers nor
+        // valid JSON events.
+        if let Some(escaped) = extract_balanced_object(rest) {
+            let payload = unescape_json(&escaped);
+            if !is_placeholder_marker(&payload) {
                 return Ok(payload);
             }
-        }
-        // Fallback heuristic for lines that are not valid JSON.
-        if let Some(escaped) = extract_balanced_object(rest) {
-            return Ok(unescape_json(&escaped));
         }
     }
     bail!("no marker found")
 }
 
-fn search_strings(value: &Value, visit: &mut dyn FnMut(&str)) {
+/// The prompts embed example marker payloads that the agent must replace
+/// with its own verdict. A payload whose summary is verbatim placeholder
+/// text carries no verdict information; treat it as absent.
+fn is_placeholder_marker(payload: &str) -> bool {
+    const PLACEHOLDER_SUMMARIES: [&str; 2] = ["brief summary", "brief independent review summary"];
+    serde_json::from_str::<AgentResult>(payload)
+        .map(|result| PLACEHOLDER_SUMMARIES.contains(&result.summary.as_str()))
+        .unwrap_or(false)
+}
+
+/// Collect the text of every assistant message in a decoded transcript
+/// event. Recursion into the decoded structure covers both the
+/// `message_end` shape (`{"message": {...}}`) and the `agent_end` shape
+/// (`{"messages": [...]}`); system/user messages are skipped because only
+/// the assistant emits the result marker.
+fn collect_assistant_texts(value: &Value, texts: &mut Vec<String>) {
     match value {
-        Value::String(text) => visit(text),
-        Value::Array(items) => items.iter().for_each(|item| search_strings(item, visit)),
-        Value::Object(map) => map.values().for_each(|item| search_strings(item, visit)),
+        Value::Object(map) => {
+            if map.get("role").and_then(Value::as_str) == Some("assistant") {
+                if let Some(content) = map.get("content").and_then(Value::as_array) {
+                    for item in content {
+                        for field in ["text", "thinking"] {
+                            if let Some(text) = item.get(field).and_then(Value::as_str) {
+                                texts.push(text.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            for child in map.values() {
+                collect_assistant_texts(child, texts);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_assistant_texts(item, texts);
+            }
+        }
         _ => {}
     }
 }
 
-/// Extract the balanced `{...}` payload that starts at/after RESULT_PREFIX
-/// inside an already-decoded string value.
-fn marker_payload_in(text: &str) -> Option<String> {
-    let position = text.find(RESULT_PREFIX)? + RESULT_PREFIX.len();
+/// Extract the balanced `{...}` payload that starts at/after the LAST
+/// `RESULT_PREFIX` occurrence inside an already-decoded string value, so a
+/// quoted prompt example preceding the real verdict does not shadow it.
+fn last_marker_payload_in(text: &str) -> Option<String> {
+    let position = text.rfind(RESULT_PREFIX)? + RESULT_PREFIX.len();
     let rest = &text[position..];
     let start = rest.find('{')?;
     let bytes = rest.as_bytes();
@@ -441,5 +490,48 @@ mod tests {
         assert_eq!(result.status, "blocked");
         assert_eq!(result.findings, vec!["a".to_string()]);
         assert!(result.summary.contains("braces"));
+    }
+
+    #[test]
+    fn ignores_prompt_example_marker_in_agent_end_and_prefers_real_verdict() {
+        // Regression: an agent_end event embeds the full prompt (with its
+        // example markers) plus the assistant's own message. The prompt
+        // examples must not be mistaken for the verdict.
+        let prompt_text = r#"instructions...\nHAMSTIK_WHEEL_RESULT={\"status\":\"ready_for_review\",\"summary\":\"brief summary\",\"findings\":[]}\nHAMSTIK_WHEEL_RESULT={\"status\":\"blocked\",\"summary\":\"why work cannot safely continue\",\"findings\":[\"blocking reason\"]}"#;
+        let review_verdict = r#"HAMSTIK_WHEEL_RESULT={\"status\":\"blocked\",\"summary\":\"CLI-32 is not implemented at all\",\"findings\":[]}"#;
+        let event = format!(
+            r#"{{"type":"agent_end","messages":[{{"role":"system","content":""}},{{"role":"user","content":[{{"type":"text","text":"{prompt_example}"}}]}},{{"role":"assistant","content":[{{"type":"text","text":"{verdict}"}}]}}]}}"#,
+            prompt_example = prompt_text,
+            verdict = review_verdict,
+        );
+        let result = parse_agent_result(&event).unwrap();
+        assert_eq!(result.status, "blocked");
+        assert!(result.summary.contains("not implemented"));
+    }
+
+    #[test]
+    fn rejects_transcript_with_only_prompt_example_markers() {
+        let event = r#"{"type":"agent_end","messages":[{"role":"system","content":""},{"role":"user","content":[{"type":"text","text":"HAMSTIK_WHEEL_RESULT={\"status\":\"ready_for_review\",\"summary\":\"brief summary\",\"findings\":[]}"}]}]}"#;
+        assert!(parse_agent_result(event).is_err());
+    }
+
+    #[test]
+    fn ignores_example_markers_in_assistant_quoted_prompt() {
+        // The assistant echoes the prompt examples inside its own thinking
+        // but emits a real verdict in its text.
+        let event = r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"HAMSTIK_WHEEL_RESULT={\"status\":\"ready_for_review\",\"summary\":\"brief summary\",\"findings\":[]}"},{"type":"text","text":"HAMSTIK_WHEEL_RESULT={\"status\":\"pass\",\"summary\":\"reviewed\",\"findings\":[]}"}]}}"#;
+        let result = parse_agent_result(event).unwrap();
+        assert_eq!(result.status, "pass");
+        assert_eq!(result.summary, "reviewed");
+    }
+
+    #[test]
+    fn parses_real_marker_after_placeholder_in_text() {
+        // Assistant text contains a placeholder quote followed by the real
+        // marker; the real (last) one wins.
+        let event = r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"example: HAMSTIK_WHEEL_RESULT={\"status\":\"pass\",\"summary\":\"brief independent review summary\",\"findings\":[]}\nHAMSTIK_WHEEL_RESULT={\"status\":\"blocked\",\"summary\":\"real reason\",\"findings\":[\"x\"]}"}]}}"#;
+        let result = parse_agent_result(event).unwrap();
+        assert_eq!(result.status, "blocked");
+        assert_eq!(result.summary, "real reason");
     }
 }
