@@ -16,7 +16,7 @@ use crate::{
     logging::Logger,
     pi::{implementation_prompt, review_prompt, PiRunner},
     state::{ActiveWorkItem, Phase, StateStore, WheelState},
-    validation::run_all,
+    validation::{run_all, ValidationKind},
 };
 
 pub struct LoopEngine {
@@ -44,7 +44,11 @@ impl LoopEngine {
             pi,
             store: StateStore::new(state_path),
             logs_root,
-            logger: Logger::new(logger.timestamps(), logger.log_file_path().as_deref())?,
+            logger: Logger::new(
+                logger.timestamps(),
+                logger.log_file_path().as_deref(),
+                logger.verbose(),
+            )?,
         })
     }
 
@@ -193,6 +197,10 @@ impl LoopEngine {
                     self.logger.blank();
                     self.logger
                         .info(&format!("Completed {completed}/{limit} Work Item(s)."));
+                    if completed + skipped < limit {
+                        self.logger
+                            .info("[continue] Selecting the next eligible Work Item.");
+                    }
                     self.logger.blank();
                 }
                 ProcessOutcome::Skipped => {
@@ -444,21 +452,37 @@ impl LoopEngine {
             state.phase,
             Phase::PreReviewValidation | Phase::Reviewing | Phase::FinalValidation
         ) {
-            let mut evidence = if state.phase == Phase::PreReviewValidation {
+            let (mut evidence, mut review_tag) = if state.phase == Phase::PreReviewValidation {
                 self.logger.blank();
-                self.logger.info("[validate] pre-review");
+                self.logger.info("[inspect] pre-review checks");
                 let report = run_all(
                     self.repo.root(),
                     &self.config.validation.commands,
                     &self.logger,
+                    ValidationKind::Inspection,
                 )?;
                 let full_evidence = report.evidence();
+                let validation_log = self.log_path(&current.key, "pre-review-validation.log");
                 self.write_log(&current.key, "pre-review-validation.log", &full_evidence)?;
+                if report.passed {
+                    self.logger.info("[inspect] pre-review checks clean");
+                } else {
+                    self.logger.info(&format!(
+                        "[remediate] Pre-review checks found issues; the reviewer will attempt repairs (details: {}).",
+                        validation_log.display()
+                    ));
+                }
                 // Bounded digest for the prompt: full output can exceed the
                 // review model's context window (observed: 49K-token overflow).
-                report.evidence_digest(2000)
+                (
+                    report.evidence_digest(2000),
+                    if report.passed { "review" } else { "remediate" },
+                )
             } else {
-                "This is a resumed review phase. Independently inspect the current working tree and rerun relevant checks; do not assume an earlier review result still applies.".to_string()
+                (
+                    "This is a resumed review phase. Independently inspect the current working tree and rerun relevant checks; do not assume an earlier review result still applies.".to_string(),
+                    "review/remediate",
+                )
             };
 
             let starting_cycle = state.review_cycle.max(1);
@@ -469,7 +493,7 @@ impl LoopEngine {
                 self.store.save(state)?;
                 self.logger.blank();
                 self.logger.info(&format!(
-                    "[review] cycle {cycle}/{} with {}",
+                    "[{review_tag}] cycle {cycle}/{} with {}",
                     self.config.r#loop.max_review_cycles, self.config.models.review
                 ));
                 let prompt = review_prompt(
@@ -499,6 +523,14 @@ impl LoopEngine {
                         review.status,
                         review.findings.join("\n")
                     );
+                    review_tag = "remediate";
+                    if cycle < self.config.r#loop.max_review_cycles {
+                        self.logger.info(&format!(
+                            "[remediate] Review found issues; continuing with cycle {}/{}.",
+                            cycle + 1,
+                            self.config.r#loop.max_review_cycles
+                        ));
+                    }
                     continue;
                 }
                 if !review.findings.is_empty() {
@@ -506,17 +538,27 @@ impl LoopEngine {
                         "Reviewer claimed PASS but still reported findings:\n{}",
                         review.findings.join("\n")
                     );
+                    review_tag = "remediate";
+                    if cycle < self.config.r#loop.max_review_cycles {
+                        self.logger.info(&format!(
+                            "[remediate] Review reported unresolved findings; continuing with cycle {}/{}.",
+                            cycle + 1,
+                            self.config.r#loop.max_review_cycles
+                        ));
+                    }
                     continue;
                 }
 
                 state.phase = Phase::FinalValidation;
                 self.store.save(state)?;
                 self.logger.blank();
-                self.logger.info(&format!("[validate] final cycle {cycle}"));
+                self.logger
+                    .info(&format!("[validate] final checks for cycle {cycle}"));
                 let final_report = run_all(
                     self.repo.root(),
                     &self.config.validation.commands,
                     &self.logger,
+                    ValidationKind::Final,
                 )?;
                 let final_evidence = final_report.evidence();
                 self.write_log(
@@ -525,13 +567,26 @@ impl LoopEngine {
                     &final_evidence,
                 )?;
                 if final_report.passed {
+                    self.logger.info("[validate] Final validation passed.");
                     passed = true;
                     break;
                 }
                 evidence = final_report.evidence_digest(2000);
+                review_tag = "remediate";
+                if cycle < self.config.r#loop.max_review_cycles {
+                    self.logger.info(&format!(
+                        "[remediate] Final checks found issues; starting remediation cycle {}/{}.",
+                        cycle + 1,
+                        self.config.r#loop.max_review_cycles
+                    ));
+                }
             }
 
             if !passed {
+                self.logger.error(&format!(
+                    "[failed] Review and remediation did not converge after {} cycle(s).",
+                    self.config.r#loop.max_review_cycles
+                ));
                 bail!(
                     "review/validation did not reach PASS within {} cycle(s)",
                     self.config.r#loop.max_review_cycles
@@ -628,11 +683,12 @@ impl LoopEngine {
             state.completed_this_run += 1;
             self.store.clear_active(state)?;
             match commit_sha.as_deref() {
-                Some(sha) => self
-                    .logger
-                    .info(&format!("{} complete at {}", current.key, sha)),
+                Some(sha) => self.logger.info(&format!(
+                    "[complete] {} committed at {} and closed.",
+                    current.key, sha
+                )),
                 None => self.logger.info(&format!(
-                    "{} complete (changes left uncommitted by configuration)",
+                    "[complete] {} closed; changes left uncommitted by configuration.",
                     current.key
                 )),
             }

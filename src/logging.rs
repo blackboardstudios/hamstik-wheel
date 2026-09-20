@@ -22,12 +22,13 @@ pub enum TimestampMode {
 pub struct Logger {
     timestamps: TimestampMode,
     log_file_path: Option<PathBuf>,
+    verbose: bool,
     activity_enabled: bool,
     file: Mutex<Option<std::fs::File>>,
 }
 
 impl Logger {
-    pub fn new(timestamps: TimestampMode, log_file: Option<&Path>) -> Result<Self> {
+    pub fn new(timestamps: TimestampMode, log_file: Option<&Path>, verbose: bool) -> Result<Self> {
         let file = match log_file {
             Some(path) => {
                 if let Some(parent) = path.parent() {
@@ -50,6 +51,7 @@ impl Logger {
         Ok(Self {
             timestamps,
             log_file_path: log_file.map(Path::to_path_buf),
+            verbose,
             activity_enabled,
             file: Mutex::new(file),
         })
@@ -61,6 +63,10 @@ impl Logger {
 
     pub fn log_file_path(&self) -> Option<PathBuf> {
         self.log_file_path.clone()
+    }
+
+    pub fn verbose(&self) -> bool {
+        self.verbose
     }
 
     pub fn activity_enabled(&self) -> bool {

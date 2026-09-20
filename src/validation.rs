@@ -8,6 +8,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::logging::Logger;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationKind {
+    Inspection,
+    Final,
+}
+
+impl ValidationKind {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Inspection => "inspect",
+            Self::Final => "validate",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationCommandResult {
     pub command: String,
@@ -101,26 +116,45 @@ fn tail_chars(text: &str, max: usize) -> (String, bool) {
     (cleaned, true)
 }
 
-pub fn run_all(repo_root: &Path, commands: &[String], logger: &Logger) -> Result<ValidationReport> {
+pub fn run_all(
+    repo_root: &Path,
+    commands: &[String],
+    logger: &Logger,
+    kind: ValidationKind,
+) -> Result<ValidationReport> {
     let mut results = Vec::new();
     let mut all_pass = true;
+    let tag = kind.tag();
 
     for command in commands {
-        logger.info(&format!("[validate] $ {command}"));
+        logger.info(&format!("[{tag}] $ {command}"));
         let output = shell_command(repo_root, command)
             .with_context(|| format!("failed to execute validation command: {command}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        if !stdout.is_empty() {
-            print!("{stdout}");
-            logger.append_raw(&stdout);
-        }
-        if !stderr.is_empty() {
-            eprint!("{stderr}");
-            logger.append_raw(&stderr);
+        if logger.verbose() {
+            if !stdout.is_empty() {
+                print!("{stdout}");
+                if !stdout.ends_with('\n') {
+                    println!();
+                }
+                logger.append_raw(&stdout);
+            }
+            if !stderr.is_empty() {
+                eprint!("{stderr}");
+                if !stderr.ends_with('\n') {
+                    eprintln!();
+                }
+                logger.append_raw(&stderr);
+            }
         }
         let passed = output.status.success();
         all_pass &= passed;
+        if passed {
+            logger.info(&format!("[{tag}] ✓ checks clean"));
+        } else {
+            logger.info(&format!("[{tag}] issues found; output captured"));
+        }
         results.push(ValidationCommandResult {
             command: command.clone(),
             exit_code: output.status.code(),
@@ -158,9 +192,42 @@ mod tests {
     #[test]
     fn empty_validation_set_is_vacuously_passed() {
         let dir = tempfile::tempdir().unwrap();
-        let logger = Logger::new(crate::logging::TimestampMode::None, None).unwrap();
-        let report = run_all(dir.path(), &[], &logger).unwrap();
+        let logger = Logger::new(crate::logging::TimestampMode::None, None, false).unwrap();
+        let report = run_all(dir.path(), &[], &logger, ValidationKind::Inspection).unwrap();
         assert!(report.passed);
+    }
+
+    #[test]
+    fn validation_kind_uses_non_terminal_inspection_label() {
+        assert_eq!(ValidationKind::Inspection.tag(), "inspect");
+        assert_eq!(ValidationKind::Final.tag(), "validate");
+    }
+
+    #[test]
+    fn non_verbose_inspection_keeps_raw_failure_word_out_of_progress_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("wheel.log");
+        let logger =
+            Logger::new(crate::logging::TimestampMode::None, Some(&log_path), false).unwrap();
+        std::fs::write(
+            dir.path().join("validator-output.txt"),
+            "RAW_VALIDATOR_FAIL_MARKER",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let command = "cat validator-output.txt; exit 1".to_string();
+        #[cfg(windows)]
+        let command = "type validator-output.txt & exit /b 1".to_string();
+
+        let report = run_all(dir.path(), &[command], &logger, ValidationKind::Inspection).unwrap();
+
+        assert!(!report.passed);
+        assert!(report.commands[0]
+            .stdout
+            .contains("RAW_VALIDATOR_FAIL_MARKER"));
+        let progress_log = std::fs::read_to_string(log_path).unwrap();
+        assert!(progress_log.contains("[inspect] issues found; output captured"));
+        assert!(!progress_log.contains("RAW_VALIDATOR_FAIL_MARKER"));
     }
 
     #[test]

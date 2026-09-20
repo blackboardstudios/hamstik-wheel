@@ -127,7 +127,7 @@ Hamstik Work Item
         ↓
  Pi implementation session
         ↓
-  repository validation
+ pre-review inspection
         ↓
  fresh Pi review/remediation session
         ↓
@@ -202,13 +202,15 @@ new one; `resume` exists for when that should be the only thing that happens.
 ## Output logging
 
 All Wheel-generated progress lines (`Selected …`, `[claim]`, `[implement]`,
-`[validate]`, `[review]`, `[commit]`, `[complete]`, doctor results, and errors)
+`[inspect]`, `[remediate]`, `[review]`, `[validate]`, `[commit]`, `[complete]`,
+doctor results, and errors)
 can be timestamped and mirrored to a file. These are global options, accepted
 before the subcommand:
 
 ```bash
 hamstik-wheel --timestamps utc run --max-items 5
 hamstik-wheel --log-file wheel-run.log once
+hamstik-wheel --verbose run --max-items 5
 hamstik-wheel --no-timestamps status
 ```
 
@@ -219,11 +221,14 @@ hamstik-wheel --no-timestamps status
   selected timestamps applied) to the given file. The file is opened in append
   mode and created (including parent directories) if missing, so repeated runs
   accumulate one continuous history.
+- `--verbose` — stream validation subprocess output verbatim. By default Wheel
+  shows concise inspection/remediation progress and keeps the full output in
+  the per-Work-Item validation log.
 
-Timestamps apply only to lines Wheel generates itself. Validation subprocess
-output is streamed through verbatim — with a timestamp prefix — mirrored into
-`--log-file` when enabled, and continues to be captured verbatim in the
-per-Work-Item logs under Git metadata.
+Timestamps apply only to lines Wheel generates itself. With `--verbose`,
+validation subprocess output is streamed verbatim and mirrored into
+`--log-file` when enabled. With or without `--verbose`, the complete output is
+captured in per-Work-Item logs under Git metadata.
 
 ## Live agent activity
 
@@ -379,9 +384,9 @@ agent's self-report:
 ```text
 implementation complete
        ↓
-pre-review validation passes
+pre-review inspection records evidence
        ↓
-independent review returns PASS (zero findings)
+independent review/remediation returns PASS (zero findings)
        ↓
 remediation, if the reviewer reported findings
        ↓
@@ -392,12 +397,14 @@ git commit succeeds
 Hamstik close succeeds
 ```
 
-All configured validation commands must exit 0 before review and again after
-the review passes. A reviewer `pass` that still reports findings is treated as
-a failure and fed into the next review cycle, as is a failed final validation.
-Review/remediation repeats up to `max_review_cycles`; if the loop never
-converges, Wheel stops with an error, leaves the Work Item open, and keeps its
-state persisted for inspection or `resume`.
+All configured validation commands run before review. A nonzero pre-review
+result is diagnostic evidence: Wheel reports that remediation is starting and
+gives the reviewer an opportunity to repair the problem. A reviewer `pass`
+that still reports findings is fed into the next remediation cycle, as is a
+nonzero final validation result. Every command must exit 0 at the final gate.
+Review/remediation repeats up to `max_review_cycles`; only an exhausted or
+blocked loop is reported as failed. Wheel then leaves the Work Item open and
+keeps its state persisted for inspection or `resume`.
 
 ### Unattended runs
 

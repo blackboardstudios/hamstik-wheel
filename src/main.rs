@@ -36,6 +36,9 @@ struct Cli {
     /// Append a mirror of Wheel output (timestamps included) to this file.
     #[arg(long, value_name = "PATH")]
     log_file: Option<PathBuf>,
+    /// Stream full validation subprocess output instead of only concise progress.
+    #[arg(long)]
+    verbose: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -95,8 +98,8 @@ fn run() -> Result<()> {
     } else {
         cli.timestamps.into()
     };
-    let logger =
-        Logger::new(timestamps, cli.log_file.as_deref()).context("failed to initialize logging")?;
+    let logger = Logger::new(timestamps, cli.log_file.as_deref(), cli.verbose)
+        .context("failed to initialize logging")?;
     match cli.command {
         Commands::Init => {
             let repo = GitRepo::discover()?;
