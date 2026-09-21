@@ -286,9 +286,23 @@ Logs use sibling path:
   "reviewCycle": 1,
   "completedThisRun": 0,
   "lastError": null,
+  "skipLedger": [
+    {
+      "key": "HAM-124",
+      "title": "Another",
+      "reason": "model-timeout",
+      "model": "gb10/bonsai2-27b",
+      "skippedAt": "2026-09-20T05:41:57Z"
+    }
+  ],
   "updatedAt": "2026-09-17T21:30:00Z"
 }
 ```
+
+`skipLedger` keeps the latest entry per Work Item key (older entries are
+replaced), is absent in state files written before it existed
+(`#[serde(default)]`), and is consulted for selection backoff and re-selection
+warnings.
 
 ### 7.3 Phases
 
@@ -303,6 +317,9 @@ Rust enum serialized in snake_case:
 - `final_validation`
 - `committing`
 - `closing`
+- `skipping` — a skip was requested and tree/branch/status cleanup is in
+  progress; persisted before cleanup starts so the next invocation completes
+  it (crash-safe skip path)
 
 ### 7.4 Atomic write
 
@@ -486,6 +503,11 @@ run(limit):
 
 Resume uses persisted phase conservatively:
 
+- `skipping`: the previous invocation crashed during skip cleanup — complete
+  the cleanup idempotently (WIP preservation when the tree is dirty, baseline
+  restore, return-to-pool transition when the item is still `in_progress`),
+  post the skip comment, record the ledger entry, and clear active state;
+  do NOT re-implement;
 - `selected`: re-read context and continue claim;
 - `claimed`/`implementing`: rerun a fresh implementer. Prompt explicitly tells it to inspect and continue any partial working-tree changes rather than assume a pristine tree;
 - `pre_review_validation`: rerun validation;
@@ -513,6 +535,15 @@ Checks:
 9. no incompatible active state;
 10. clean working tree when required and no active state;
 11. non-empty validation command set (warning rather than fatal may be configurable later).
+
+Advisories (warnings, never fatal — doctor must remain usable offline and
+before first-run setup):
+
+- stranded Work Items: `in_progress` items assigned to the authenticated user
+  that are not the Wheel's active item; selection cannot see them until they
+  are moved back to a candidate status;
+- stale WIP branches: `wheel/wip/<KEY>` branches (for active/ledger keys)
+  already contained in `HEAD`, i.e. salvage candidates.
 
 ## 13. Logging
 
@@ -587,15 +618,27 @@ run continues with the next item:
 
 1. the failure is recorded in persisted state (`lastError`) and in a failure
    comment on the Work Item (idempotency-keyed, best-effort);
-2. in-progress working-tree changes, when any exist, are committed to a
-   `wheel/wip/<KEY>` branch (never touching the current branch's history);
-3. the working tree is restored to that item's recorded baseline
+2. the persisted phase is set to `Skipping` **before** any working-tree or
+   Hamstik mutation, so a crash anywhere in steps 3-5 is recovered by the
+   next `run`/`once`/`resume` instead of stranding the item in
+   `in_progress` (observed failure mode: a process kill between the WIP
+   commit and the baseline restore left an item claimed and invisible to
+   selection forever);
+3. in-progress working-tree changes, when any exist, are committed to a
+   `wheel/wip/<KEY>` branch (never touching the current branch's history;
+   pre-existing branches from earlier skips of the same key get a numeric
+   suffix);
+4. the working tree is restored to that item's recorded baseline
    (`git reset --hard <baseline>` and `git clean -fd`) so the next
    selection's clean-tree check passes; a failed restore or preservation
    halts the run regardless of mode;
-4. the item is transitioned back to `todo` (best-effort) so it stays in the
-   eligible pool for later runs;
-5. active state is cleared and the loop advances.
+5. the item is returned to the eligible pool: its current status is read
+   first, and the `todo` transition is attempted only when the item is still
+   `in_progress` (best-effort; the item stays claimed only if the transition
+   fails, which is logged);
+6. active state is cleared, the failure is appended to the per-item skip
+   ledger (failure classification + model active at failure), and the loop
+   advances.
 
 Additional resilience controls:
 
@@ -606,8 +649,23 @@ Additional resilience controls:
 - `[loop].implement_retry = true` re-runs the implementation session exactly
   once when the first attempt fails to produce a parsable result marker;
   explicit `blocked` results and non-marker-producing retries are final.
+- Review sessions get one automatic retry on transient process failures
+  (wall-clock timeout, abnormal exit, lost/unparsable output); an explicit
+  `blocked` review result is a considered answer and is never retried. The
+  failed first attempt's transcript is persisted as
+  `review-<NN>-attempt-01.log` before the retry.
+- Selection consults the skip ledger: an item whose latest skip was a
+  timeout/exit of a still-configured model is deferred for a 30-minute
+  cooldown (it stays in its current status and remains eligible), and any
+  re-selection of a previously skipped item logs the prior failure. The run
+  halts instead of cycling when the same item is skipped and immediately
+  re-selected.
 - `run` counts skipped items and reports them in the run summary; `once`
   treats a skipped item as a completed outcome.
+- `doctor` reports stranded `in_progress` items assigned to the
+  authenticated user (invisible to selection) and `wheel/wip/<KEY>` branches
+  already contained in `HEAD` (salvage candidates for deletion); `status`
+  includes the skip ledger.
 
 Wheel MUST NOT:
 
@@ -629,7 +687,10 @@ Unit tests should cover:
 - candidate status/priority ordering;
 - Pi result marker parsing, including markers embedded in NDJSON event lines;
 - event-to-activity-description mapping and elapsed-time formatting;
-- state serialization;
+- state serialization, including the skip ledger and `skipping` phase;
+- failure classification and model extraction from error text;
+- idempotency-key uniqueness across attempts;
+- WIP branch enumeration (base + numeric-suffixed variants);
 - commit-message expansion;
 - validation report pass/fail aggregation.
 

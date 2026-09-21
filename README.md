@@ -189,11 +189,11 @@ concurrency beyond one Work Item is a non-goal by design.
 | Command | Purpose |
 | --- | --- |
 | `hamstik-wheel init` | Create `.hamstik-wheel.toml` in the current Git repository |
-| `hamstik-wheel doctor` | Verify Git, Pi, Hamstik CLI, its command surface, configured models, and repository readiness |
+| `hamstik-wheel doctor` | Verify Git, Pi, Hamstik CLI, its command surface, configured models, and repository readiness; advise on stranded in_progress items and stale WIP branches |
 | `hamstik-wheel once` | Process exactly one Work Item, resuming an active item first when needed |
 | `hamstik-wheel run --max-items N` | Process Work Items sequentially until the requested/configured limit or no work remains |
 | `hamstik-wheel resume` | Resume the interrupted active Work Item; errors when nothing is active |
-| `hamstik-wheel status` | Show persisted loop state: phase, Work Item, baseline SHA, review cycle, last error |
+| `hamstik-wheel status` | Show persisted loop state: phase, Work Item, baseline SHA, review cycle, last error, skip ledger |
 
 `run` and `once` automatically resume an active Work Item before selecting a
 new one; `resume` exists for when that should be the only thing that happens.
@@ -415,11 +415,32 @@ changes on a `wheel/wip/<KEY>` branch (when any exist), restores the working
 tree to that item's baseline, transitions the item back to `todo` so it
 stays eligible for later runs, and continues with the next item. The run
 summary reports how many items were skipped. Combined with
-`agent_timeout_minutes` (a hung session is killed at the wall-clock cap) and
+`agent_timeout_minutes` (a hung session is killed at the wall-clock cap),
 `implement_retry` (one extra session when the first attempt emits no
-parsable result), a `run` can process a queue overnight: one bad item costs
+parsable result), and the review session's automatic single retry on
+transient failures (timeout/exit/lost output — an explicit `blocked` answer
+is never retried), a `run` can process a queue overnight: one bad item costs
 that item, not the whole night. Skipped items keep their failure comment
 and WIP branch for manual pickup or a later automated attempt.
+
+The skip path is crash-safe. Wheel persists a `Skipping` phase *before* it
+touches the working tree, so a process killed mid-cleanup (observed: a kill
+between the WIP commit and the baseline restore left an item claimed in
+`in_progress` forever, invisible to selection) is recovered automatically by
+the next `run`/`once`/`resume`: the remaining cleanup steps are completed
+idempotently and the item returns to the eligible pool.
+
+Wheel keeps a small skip ledger in its state file (latest entry per item:
+failure classification and the model active at failure time). Selection uses
+it two ways:
+
+- An item whose last failure was a timeout/exit of a model that is still
+  configured is deferred for a 30-minute cooldown instead of being
+  immediately re-failed — repeating a deterministic failure burns the run's
+  limit without changing the outcome.
+- A different-model or expired-cooldown re-selection logs the prior failure
+  so the re-attempt is visibly informed, and the loop stops (rather than
+  cycling) when the same item is skipped and immediately re-selected twice.
 
 When the gates pass, Wheel commits with `git add -A` and the configured
 message template, records the commit SHA, and asks Hamstik CLI to close the
@@ -445,6 +466,17 @@ hamstik-wheel resume    # continue the interrupted Work Item from its persisted 
 Resumed runs re-read the authoritative Work Item context so agent input stays
 current. While an item's orchestration state is active, Wheel does not select
 a new Work Item — `once` and `run` resume the active item first.
+
+`hamstik-wheel doctor` also reports two historical failure signatures so a
+crashed night's damage is visible in one command:
+
+- **Stranded items** — Work Items assigned to you that are still `in_progress`
+  but not the Wheel's active item. Selection polls only the configured
+  candidate statuses, so such an item is invisible to the Wheel until it is
+  moved back (`hamstik work transition <KEY> todo`).
+- **Stale WIP branches** — `wheel/wip/<KEY>` branches already contained in
+  `HEAD`, meaning their content was salvaged or superseded and the branch is
+  a deletion candidate.
 
 ## Running unattended
 

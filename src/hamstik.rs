@@ -175,6 +175,34 @@ impl HamstikCli {
         parse_candidates(&value)
     }
 
+    /// Open Work Items assigned to the authenticated user in the given
+    /// statuses. Used by doctor to detect items a crashed run stranded in
+    /// `in_progress` — those are invisible to selection (which polls only the
+    /// configured candidate statuses) until moved back manually.
+    pub fn list_assigned_to_me(
+        &self,
+        statuses: &[&str],
+        item_types: &[String],
+    ) -> Result<Vec<WorkItemSummary>> {
+        let mut args = vec![
+            "work".to_string(),
+            "list".to_string(),
+            "--assignee".to_string(),
+            "me".to_string(),
+        ];
+        for status in statuses {
+            args.push("--status".to_string());
+            args.push((*status).to_string());
+        }
+        for item_type in item_types {
+            args.push("--type".to_string());
+            args.push(item_type.clone());
+        }
+        args.push("--all".to_string());
+        let value = self.run_json_owned(&args)?;
+        parse_candidates(&value)
+    }
+
     pub fn context(&self, key: &str) -> Result<Value> {
         self.run_json(&[
             "work",
@@ -197,6 +225,14 @@ impl HamstikCli {
 
     pub fn close(&self, key: &str) -> Result<Value> {
         self.run_json(&["work", "close", key])
+    }
+
+    /// Current status name of a Work Item (`work view` returns the item with
+    /// a plain `status` string). Used to guard the skip path's return-to-pool
+    /// transition.
+    pub fn item_status(&self, key: &str) -> Result<String> {
+        let value = self.run_json(&["work", "view", key])?;
+        Ok(named_value(value.get("status")).unwrap_or_default())
     }
 
     /// Transition an item to an arbitrary allowed target status (e.g. `todo`

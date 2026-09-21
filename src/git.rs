@@ -65,6 +65,17 @@ impl GitRepo {
         Ok(self.run(&["status", "--porcelain"])?.is_empty())
     }
 
+    /// Whether `ancestor` (a branch or SHA) is reachable from `descendant`.
+    /// Used to detect WIP branches whose content was already merged/salvaged.
+    pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> bool {
+        Command::new("git")
+            .current_dir(&self.root)
+            .args(["merge-base", "--is-ancestor", ancestor, descendant])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
     pub fn metadata_path(&self, relative: &str) -> Result<PathBuf> {
         let rendered = self.run(&["rev-parse", "--git-path", relative])?;
         let path = PathBuf::from(rendered);
@@ -93,19 +104,23 @@ impl GitRepo {
         if !commit.status.success() {
             // git writes "nothing to commit, working tree clean" and other
             // commit failures to stdout, so include both streams (observed:
-            // an empty message because the explanation was on stdout).
+            // an empty message because the explanation was on stdout). The
+            // exit code is always included: an empty detail with no code
+            // (observed: a hook exit with no output) is undiagnosable.
             let stderr = String::from_utf8_lossy(&commit.stderr).into_owned();
             let stdout = String::from_utf8_lossy(&commit.stdout).into_owned();
             let stderr = stderr.trim();
             let stdout = stdout.trim();
-            let detail = if stderr.is_empty() {
-                stdout.to_string()
-            } else if stdout.is_empty() {
-                stderr.to_string()
-            } else {
-                format!("{stderr}; stdout: {stdout}")
+            let detail = match (stderr.is_empty(), stdout.is_empty()) {
+                (true, true) => format!("exit {:?}", commit.status.code()),
+                (false, true) => stderr.to_string(),
+                (true, false) => stdout.to_string(),
+                (false, false) => format!("{stderr}; stdout: {stdout}"),
             };
-            bail!("git commit failed: {detail}");
+            bail!(
+                "git commit failed (exit {:?}): {detail}",
+                commit.status.code()
+            );
         }
         self.head()
     }
@@ -148,61 +163,89 @@ impl GitRepo {
 
     /// Preserve in-progress working-tree changes from a failed Work Item on
     /// a dedicated WIP branch before the tree is restored to the baseline.
-    /// Returns the branch name, or Ok(None) when the tree was already clean
-    /// (nothing to preserve). Never alters the current branch's history.
-    pub fn preserve_wip(&self, key: &str, _baseline_sha: &str) -> Result<Option<String>> {
-        if self.is_clean()? {
+    /// Returns the branch name, or Ok(None) when there was nothing to
+    /// preserve (clean tree at the baseline). Never alters the current
+    /// branch's history.
+    ///
+    /// Also heals an interrupted preservation (observed: a process kill
+    /// between the WIP commit and the branch anchor left CLI-32's work as an
+    /// unanchored commit ahead of the baseline with a clean tree — a naive
+    /// "clean tree means nothing to do" check would then destroy it on the
+    /// baseline reset). A clean tree whose HEAD is ahead of the baseline is
+    /// treated as an unanchored WIP commit: it is anchored on the branch
+    /// before the reset, so preservation never loses content.
+    pub fn preserve_wip(&self, key: &str, baseline_sha: &str) -> Result<Option<String>> {
+        // Standard path: commit the dirty tree (its parent chain already
+        // includes whatever HEAD was, which on the skip path is the baseline).
+        if !self.is_clean()? {
+            let add = Command::new("git")
+                .current_dir(&self.root)
+                .args(["add", "-A"])
+                .status()
+                .context("failed to execute git add -A for WIP preservation")?;
+            if !add.success() {
+                bail!("git add -A failed during WIP preservation");
+            }
+
+            let commit = Command::new("git")
+                .current_dir(&self.root)
+                .args([
+                    "commit",
+                    "-m",
+                    &format!("WIP: {key} automated work (preserved before baseline restore)"),
+                ])
+                .output()
+                .context("failed to execute git commit for WIP preservation")?;
+            if !commit.status.success() {
+                let stderr = String::from_utf8_lossy(&commit.stderr).into_owned();
+                let stdout = String::from_utf8_lossy(&commit.stdout).into_owned();
+                let stderr = stderr.trim();
+                let stdout = stdout.trim();
+                let detail = match (stderr.is_empty(), stdout.is_empty()) {
+                    (true, true) => format!("exit {:?}", commit.status.code()),
+                    (false, true) => stderr.to_string(),
+                    (true, false) => stdout.to_string(),
+                    (false, false) => format!("{stderr}; stdout: {stdout}"),
+                };
+                bail!(
+                    "git commit failed during WIP preservation (exit {:?}): {detail}",
+                    commit.status.code()
+                );
+            }
+        }
+
+        // Whether HEAD holds a WIP commit worth anchoring: either we just
+        // committed the dirty tree, or a previous crashed preservation left
+        // HEAD ahead of the baseline with a clean tree. A repository with no
+        // commits (or an unreadable HEAD) has nothing to anchor.
+        let wip_sha = match self.head() {
+            Ok(sha) => sha,
+            Err(_) => return Ok(None),
+        };
+        if wip_sha == baseline_sha {
             return Ok(None);
         }
+
+        // Anchor a branch at the WIP commit, then reset the working
+        // tree/HEAD back to the baseline so the next selection starts clean.
         // A branch from an earlier skip of the same key may already exist
         // (observed: a timed-out review after a prior skip left
-        // `wheel/wip/CLI-32` in place); append a numeric suffix instead of
-        // failing the preservation run.
-        let base = sanitize_ref_component(key);
-        let mut branch = format!("wheel/wip/{base}");
-        let mut suffix = 1usize;
-        while self.ref_exists(&branch) {
-            suffix += 1;
-            branch = format!("wheel/wip/{base}-{suffix}");
-        }
+        // `wheel/wip/CLI-32` in place); if it already points at this exact
+        // commit the anchor is done, otherwise append a numeric suffix
+        // instead of failing the preservation run.
+        let base = format!("wheel/wip/{}", sanitize_ref_component(key));
+        let branch = if self.branch_points_at(&base, &wip_sha) {
+            base
+        } else {
+            let mut candidate = base.clone();
+            let mut suffix = 2usize;
+            while self.ref_exists(&candidate) {
+                candidate = format!("{base}-{suffix}");
+                suffix += 1;
+            }
+            candidate
+        };
 
-        let add = Command::new("git")
-            .current_dir(&self.root)
-            .args(["add", "-A"])
-            .status()
-            .context("failed to execute git add -A for WIP preservation")?;
-        if !add.success() {
-            bail!("git add -A failed during WIP preservation");
-        }
-
-        let commit = Command::new("git")
-            .current_dir(&self.root)
-            .args([
-                "commit",
-                "-m",
-                &format!("WIP: {key} automated work (preserved before baseline restore)"),
-            ])
-            .output()
-            .context("failed to execute git commit for WIP preservation")?;
-        if !commit.status.success() {
-            let stderr = String::from_utf8_lossy(&commit.stderr).into_owned();
-            let stdout = String::from_utf8_lossy(&commit.stdout).into_owned();
-            let stderr = stderr.trim();
-            let stdout = stdout.trim();
-            let detail = if stderr.is_empty() {
-                stdout.to_string()
-            } else if stdout.is_empty() {
-                stderr.to_string()
-            } else {
-                format!("{stderr}; stdout: {stdout}")
-            };
-            bail!("git commit failed during WIP preservation: {detail}");
-        }
-        let wip_sha = self.head()?;
-
-        // Anchor a branch at the WIP commit (its parent chain already
-        // includes the baseline), then reset the working tree/HEAD back to
-        // the baseline so the next selection starts clean.
         let branch_at = Command::new("git")
             .current_dir(&self.root)
             .args(["branch", branch.as_str(), wip_sha.as_str()])
@@ -215,7 +258,7 @@ impl GitRepo {
             );
         }
 
-        self.checkout_baseline(_baseline_sha)?;
+        self.checkout_baseline(baseline_sha)?;
         Ok(Some(branch))
     }
 
@@ -232,6 +275,47 @@ impl GitRepo {
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false)
+    }
+
+    /// Whether a branch exists and points exactly at `sha`.
+    fn branch_points_at(&self, branch: &str, sha: &str) -> bool {
+        Command::new("git")
+            .current_dir(&self.root)
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{branch}^{{commit}}"),
+            ])
+            .output()
+            .map(|output| {
+                output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == sha
+            })
+            .unwrap_or(false)
+    }
+
+    /// Name of the WIP branch `preserve_wip` would create for a key, plus any
+    /// numeric-suffixed variants that already exist. Used by crash recovery
+    /// (was preservation interrupted?) and by doctor advisories. The base
+    /// branch is always included so callers can detect "preservation started
+    /// but the branch was not yet created".
+    pub fn existing_wip_branches(&self, key: &str) -> Result<Vec<String>> {
+        let base = format!("wheel/wip/{}", sanitize_ref_component(key));
+        let mut branches = vec![base.clone()];
+        let mut suffix = 2usize;
+        loop {
+            let candidate = format!("{base}-{suffix}");
+            if self.ref_exists(&candidate) {
+                branches.push(candidate);
+                suffix += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(branches
+            .into_iter()
+            .filter(|b| self.ref_exists(b))
+            .collect())
     }
 }
 
@@ -336,5 +420,192 @@ mod tests {
         assert!(out.status.success());
         let repo = GitRepo::new(root).unwrap();
         assert!(repo.preserve_wip("CLI-1", "HEAD").unwrap().is_none());
+    }
+
+    #[test]
+    fn existing_wip_branches_reports_suffixed_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "wheel@test"]);
+        git(&["config", "user.name", "wheel"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        let repo = GitRepo::new(root).unwrap();
+
+        assert!(repo.existing_wip_branches("CLI-1").unwrap().is_empty());
+
+        // Simulate two prior skips of the same key; each skip requires a
+        // dirty tree for preserve_wip to act.
+        std::fs::write(root.join("first.txt"), "first\n").unwrap();
+        let first = repo.preserve_wip("CLI-7", "HEAD").unwrap().unwrap();
+        assert_eq!(first, "wheel/wip/CLI-7");
+        std::fs::write(root.join("more.txt"), "more\n").unwrap();
+        let second = repo.preserve_wip("CLI-7", "HEAD").unwrap().unwrap();
+        assert_eq!(second, "wheel/wip/CLI-7-2");
+
+        let branches = repo.existing_wip_branches("CLI-7").unwrap();
+        assert_eq!(
+            branches,
+            vec![
+                "wheel/wip/CLI-7".to_string(),
+                "wheel/wip/CLI-7-2".to_string()
+            ]
+        );
+        // A different key has no branches.
+        assert!(repo.existing_wip_branches("CLI-8").unwrap().is_empty());
+    }
+
+    /// The observed CLI-32 crash: preserve_wip committed the tree (commit
+    /// landed on the current branch), but the process died before the
+    /// baseline reset and before the WIP branch was anchored. Recovery must
+    /// reach a clean tree at the baseline without duplicating the preserved
+    /// content on a second WIP commit.
+    #[test]
+    fn recovery_after_interrupted_preservation_reaches_clean_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "wheel@test"]);
+        git(&["config", "user.name", "wheel"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        let baseline = {
+            let out = Command::new("git")
+                .current_dir(root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let repo = GitRepo::new(root).unwrap();
+
+        // Phase 1: normal preservation completes (this is what happened on
+        // the first skip of CLI-32).
+        std::fs::write(root.join("base.txt"), "changed\n").unwrap();
+        let branch = repo.preserve_wip("CLI-32", &baseline).unwrap().unwrap();
+        assert_eq!(branch, "wheel/wip/CLI-32");
+        assert!(repo.is_clean().unwrap());
+        assert_eq!(repo.head().unwrap(), baseline);
+
+        // Phase 2: simulate the interrupted attempt — dirty the tree again,
+        // commit it manually (as preserve_wip does) but crash before the
+        // branch anchor and baseline reset. HEAD is now ahead of baseline
+        // with a WIP-looking commit and NO wheel/wip branch for it.
+        std::fs::write(root.join("partial.txt"), "partial\n").unwrap();
+        git(&["add", "-A"]);
+        git(&[
+            "commit",
+            "-qm",
+            "WIP: CLI-32 automated work (preserved before baseline restore)",
+        ]);
+        let interrupted_head = repo.head().unwrap();
+        assert_ne!(interrupted_head, baseline);
+
+        // Recovery: preserve_wip sees a clean tree but HEAD ahead of the
+        // baseline — the interrupted WIP commit. It anchors that commit on a
+        // fresh suffixed branch (attempt 1's branch already exists at its
+        // own commit) and restores the baseline, never destroying content.
+        let recovered_branch = repo.preserve_wip("CLI-32", &baseline).unwrap();
+        assert_eq!(
+            recovered_branch.as_deref(),
+            Some("wheel/wip/CLI-32-2"),
+            "the interrupted commit must be anchored on a new suffixed branch, not lost"
+        );
+        repo.checkout_baseline(&baseline).unwrap();
+        assert!(repo.is_clean().unwrap());
+        assert_eq!(repo.head().unwrap(), baseline);
+        assert!(!root.join("partial.txt").exists());
+
+        // The interrupted commit content survives on the anchored branch.
+        let anchored = recovered_branch.unwrap();
+        let show = Command::new("git")
+            .current_dir(root)
+            .args(["show", &format!("{anchored}:partial.txt")])
+            .output()
+            .unwrap();
+        assert!(show.status.success());
+        assert_eq!(String::from_utf8_lossy(&show.stdout), "partial\n");
+
+        // Second recovery pass is a no-op: nothing dirty, nothing new.
+        assert!(repo.preserve_wip("CLI-32", &baseline).unwrap().is_none());
+        repo.checkout_baseline(&baseline).unwrap();
+        assert_eq!(repo.head().unwrap(), baseline);
+    }
+
+    #[test]
+    fn is_ancestor_detects_contained_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {} failed", args.join(" "));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "wheel@test"]);
+        git(&["config", "user.name", "wheel"]);
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        let base = {
+            let out = Command::new("git")
+                .current_dir(root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["branch", "topic"]);
+        std::fs::write(root.join("b.txt"), "b\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "advance"]);
+        let head = {
+            let out = Command::new("git")
+                .current_dir(root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let repo = GitRepo::new(root).unwrap();
+        // topic (at base) is an ancestor of the advanced HEAD; HEAD is not an
+        // ancestor of itself-as-branch-check direction matters.
+        assert!(repo.is_ancestor("topic", &head));
+        assert!(!repo.is_ancestor(&head, "topic"));
+        assert!(repo.is_ancestor(&base, &base));
+        assert!(!repo.is_ancestor("nonexistent-ref", &head));
     }
 }
