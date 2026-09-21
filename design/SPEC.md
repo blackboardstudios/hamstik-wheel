@@ -116,8 +116,15 @@ hamstik --no-input --json doctor
 #### Candidate discovery
 
 ```bash
+hamstik --no-input --json sprint list --all
+hamstik --no-input --json work list --sprint <ACTIVE-SPRINT-ID> --status todo --type task --type bug --type story --type feature --all
+# Fallback when there is no eligible active-sprint work:
 hamstik --no-input --json work list --status todo --type task --type bug --type story --type feature --all
 ```
+
+`hamstik sprint list` is a required capability checked through the CLI command
+manifest. All discovery calls use the same repository working directory so
+the CLI resolves the same Organization/Project context.
 
 #### Authoritative context bundle
 
@@ -203,6 +210,18 @@ Sort tuple:
 ```
 
 This is intentionally deterministic. The Hamstik CLI filters remain the primary eligibility policy.
+
+Before selecting a new item, discover all project sprints and prefer items
+from unarchived sprints with server-reported `state = active`. Do not infer
+sprint activity from dates. Query each active sprint with `work list --sprint`
+and the same status/type/label filters and `--all`. Apply skip exclusions and
+cooldowns before ranking. If multiple sprints are active, rank their combined
+eligible candidates using the existing sort tuple.
+
+Only when that pool is empty (or there are no active sprints), use the existing
+project-wide selection. Discovery failures or malformed sprint data are errors,
+not permission to bypass sprint preference. Re-evaluate on every new selection;
+resuming an active item does not perform sprint selection or replace that item.
 
 ## 6. Git integration
 

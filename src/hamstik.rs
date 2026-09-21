@@ -21,6 +21,12 @@ pub struct WorkItemSummary {
     pub created_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveSprint {
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct HamstikCli {
     repo_root: std::path::PathBuf,
@@ -111,6 +117,7 @@ impl HamstikCli {
         let mut required = vec![
             "hamstik doctor",
             "hamstik commands",
+            "hamstik sprint list",
             "hamstik work list",
             "hamstik work context",
             "hamstik work start",
@@ -156,6 +163,7 @@ impl HamstikCli {
         statuses: &[String],
         item_types: &[String],
         label_names: &[String],
+        sprint: Option<&str>,
     ) -> Result<Vec<WorkItemSummary>> {
         let mut args = vec!["work".to_string(), "list".to_string()];
         for status in statuses {
@@ -170,9 +178,20 @@ impl HamstikCli {
             args.push("--label-name".to_string());
             args.push(label.clone());
         }
+        if let Some(id) = sprint {
+            args.push("--sprint".to_string());
+            args.push(id.to_string());
+        }
         args.push("--all".to_string());
         let value = self.run_json_owned(&args)?;
         parse_candidates(&value)
+    }
+
+    /// The CLI resolves the same repository/project context as work list and
+    /// follows all pages. Lifecycle state, not date arithmetic, is authoritative.
+    pub fn active_sprints(&self) -> Result<Vec<ActiveSprint>> {
+        let value = self.run_json(&["sprint", "list", "--all"])?;
+        parse_active_sprints(&value)
     }
 
     /// Open Work Items assigned to the authenticated user in the given
@@ -354,6 +373,41 @@ fn parse_candidates(value: &Value) -> Result<Vec<WorkItemSummary>> {
     Ok(out)
 }
 
+fn parse_active_sprints(value: &Value) -> Result<Vec<ActiveSprint>> {
+    let array =
+        locate_array(value).context("could not locate Sprint array in hamstik sprint list JSON")?;
+    let mut active = Vec::new();
+    for sprint in array {
+        let state = sprint
+            .get("state")
+            .and_then(Value::as_str)
+            .filter(|state| !state.trim().is_empty())
+            .context("hamstik sprint list returned a Sprint without a lifecycle state")?;
+        let archived = ["archivedAt", "archived_at"]
+            .iter()
+            .any(|key| sprint.get(key).is_some_and(|value| !value.is_null()));
+        if normalize(state) != "active" || archived {
+            continue;
+        }
+        let id = sprint
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .context("hamstik sprint list returned an active Sprint without an id")?;
+        active.push(ActiveSprint {
+            id: id.to_string(),
+            name: sprint
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(id)
+                .to_string(),
+        });
+    }
+    active.sort_by(|a, b| a.id.cmp(&b.id));
+    active.dedup_by(|a, b| a.id == b.id);
+    Ok(active)
+}
+
 fn locate_array(value: &Value) -> Option<&Vec<Value>> {
     if let Value::Array(items) = value {
         return Some(items);
@@ -414,6 +468,36 @@ fn named_value(value: Option<&Value>) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_unarchived_active_sprints_are_preferred() {
+        let sprints = json!({"data":{"items":[
+            {"id":"future","state":"future"},
+            {"id":"done","state":"done"},
+            {"id":"archived","state":"active","archivedAt":"2026-01-01"},
+            {"id":"active","name":"Current sprint","state":"active","archivedAt":null},
+            {"id":"active","name":"Current sprint","state":"active","archivedAt":null}
+        ]}});
+        assert_eq!(
+            parse_active_sprints(&sprints).unwrap(),
+            vec![ActiveSprint {
+                id: "active".into(),
+                name: "Current sprint".into()
+            }]
+        );
+        assert!(parse_active_sprints(&json!([])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_sprint_discovery_is_not_treated_as_no_active_sprint() {
+        for value in [
+            json!({}),
+            json!({"items":[{"id":"s1"}]}),
+            json!({"items":[{"state":"active"}]}),
+        ] {
+            assert!(parse_active_sprints(&value).is_err());
+        }
+    }
 
     #[test]
     fn parses_common_envelope() {

@@ -14,7 +14,7 @@ use anyhow::{bail, Context, Result};
 use crate::{
     config::{self, Config},
     git::GitRepo,
-    hamstik::{select_next, HamstikCli},
+    hamstik::{select_next, HamstikCli, WorkItemSummary},
     logging::Logger,
     pi::{implementation_prompt, review_prompt, PiRunner, ProviderFailure},
     state::{ActiveWorkItem, Phase, SkipRecord, StateStore, WheelState},
@@ -395,27 +395,7 @@ impl LoopEngine {
             if self.config.git.require_clean_start && !self.repo.is_clean()? {
                 bail!("working tree is dirty; finish/stash existing work before Hamstik Wheel selects a new Work Item");
             }
-            let mut candidates = self.hamstik.list_candidates(
-                &self.config.hamstik.statuses,
-                &self.config.hamstik.item_types,
-                &self.config.hamstik.label_names,
-            )?;
-            candidates.retain(|item| {
-                if excluded.contains(&item.key) {
-                    return false;
-                }
-                if let Some(record) = state.last_skip(&item.key) {
-                    if self.skip_is_cooling(record) {
-                        self.logger.info(&format!(
-                            "[select] {} cooling down after {}; considering other candidates",
-                            item.key, record.reason
-                        ));
-                        return false;
-                    }
-                }
-                true
-            });
-            let Some(item) = select_next(candidates) else {
+            let Some(item) = self.select_candidate(&state, excluded)? else {
                 return Ok(ProcessOutcome::NoWork);
             };
             let baseline = self.repo.head()?;
@@ -494,6 +474,70 @@ impl LoopEngine {
         }
 
         Ok(ProcessOutcome::Completed)
+    }
+
+    fn select_candidate(
+        &self,
+        state: &WheelState,
+        excluded: &HashSet<String>,
+    ) -> Result<Option<WorkItemSummary>> {
+        let active_sprints = self.hamstik.active_sprints()?;
+        let mut sprint_candidates = Vec::new();
+        for sprint in &active_sprints {
+            self.logger.info(&format!(
+                "[select] Checking active sprint {} ({})",
+                sprint.name, sprint.id
+            ));
+            sprint_candidates.extend(self.eligible_candidates(
+                state,
+                excluded,
+                Some(&sprint.id),
+            )?);
+        }
+        if let Some(item) = select_next(sprint_candidates) {
+            self.logger.info(&format!(
+                "[select] {} selected from active sprint work",
+                item.key
+            ));
+            return Ok(Some(item));
+        }
+        if !active_sprints.is_empty() {
+            self.logger
+                .info("[select] No eligible active-sprint work; using project-wide selection");
+        }
+        Ok(select_next(
+            self.eligible_candidates(state, excluded, None)?,
+        ))
+    }
+
+    fn eligible_candidates(
+        &self,
+        state: &WheelState,
+        excluded: &HashSet<String>,
+        sprint: Option<&str>,
+    ) -> Result<Vec<WorkItemSummary>> {
+        let mut candidates = self.hamstik.list_candidates(
+            &self.config.hamstik.statuses,
+            &self.config.hamstik.item_types,
+            &self.config.hamstik.label_names,
+            sprint,
+        )?;
+        candidates.retain(|item| {
+            if excluded.contains(&item.key) {
+                return false;
+            }
+            if let Some(record) = state.last_skip(&item.key) {
+                if self.skip_is_cooling(record) {
+                    self.logger.info(&format!(
+                        "[select] {} cooling down after {}; considering other candidates",
+                        item.key, record.reason
+                    ));
+                    return false;
+                }
+            }
+            true
+        });
+        Ok(candidates)
     }
 
     fn skip_is_cooling(&self, record: &SkipRecord) -> bool {

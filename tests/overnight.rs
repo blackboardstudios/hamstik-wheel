@@ -35,12 +35,13 @@ impl Fixture {
             )
             .unwrap();
         }
-        let commands: Vec<_> = ["doctor", "commands", "work list", "work context", "work start", "work close", "work transition", "work comment add", "work edit"]
+        let commands: Vec<_> = ["doctor", "commands", "sprint list", "work list", "work context", "work start", "work close", "work transition", "work comment add", "work edit"]
             .iter().map(|command| json!({"command": format!("hamstik {command}"), "capabilities":{"json":true,"noInput":true}})).collect();
         fixture.write(
             ".git/manifest.json",
             &json!({"commands":commands}).to_string(),
         );
+        fixture.write(".git/sprints.json", "{\"items\":[]}");
         fixture.write(
             ".git/candidates.json",
             &json!([
@@ -139,13 +140,29 @@ post_completed = false
 const HAMSTIK: &str = r#"#!/bin/sh
 if [ "$1" = '--version' ]; then echo test; exit 0; fi
 shift 2
+echo "$*" >> .git/hamstik-commands
 case "$1 $2" in
   'commands ') cat .git/manifest.json;;
-  'work list') cat .git/candidates.json;;
+  'sprint list')
+    if [ -f .git/sprint-error ]; then echo 'sprint service unavailable' >&2; exit 9; fi
+    cat .git/sprints.json;;
+  'work list')
+    shift 2
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = '--sprint' ]; then
+        if [ -f .git/sprint-items-error ]; then echo 'sprint items unavailable' >&2; exit 9; fi
+        cat ".git/sprint-$2.json"; exit
+      fi
+      shift
+    done
+    cat .git/candidates.json;;
   'work context') printf '{"item":{"key":"%s"}}\n' "$3";;
   'work start') echo "$3" >> .git/starts; echo '{}';;
   'work view') echo '{"status":"in_progress"}';;
-  'work close') echo "$3" >> .git/closes; echo '{}';;
+  'work close')
+    echo "$3" >> .git/closes
+    if [ -f .git/drain-sprint ]; then echo '{"items":[]}' > ".git/sprint-$(cat .git/drain-sprint).json"; fi
+    echo '{}';;
   'work comment') cat > /dev/null; echo '{}';;
   *) echo '{}';;
 esac
@@ -346,4 +363,195 @@ fn legacy_state_recovers_latest_wip_across_deleted_suffixes() {
         f.state()["skipLedger"][0]["wipBranch"],
         "wheel/wip/TEST-1-4"
     );
+}
+
+const SPRINT_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+impl Fixture {
+    fn active_sprint(&self, items: Value) {
+        self.write(
+            ".git/sprints.json",
+            &json!({"items":[{
+                "id":SPRINT_ID,"name":"Current sprint","state":"active","archivedAt":null
+            }]})
+            .to_string(),
+        );
+        self.write(
+            &format!(".git/sprint-{SPRINT_ID}.json"),
+            &json!({"items":items}).to_string(),
+        );
+    }
+}
+
+#[test]
+fn active_sprint_work_precedes_higher_priority_project_work() {
+    let f = Fixture::new();
+    let config = f
+        .read(".hamstik-wheel.toml")
+        .replace("[hamstik]", "[hamstik]\nlabel_names = ['agent-ready']");
+    f.write(".hamstik-wheel.toml", &config);
+    f.git(&["add", "-A"]);
+    f.git(&["commit", "-qm", "label filter"]);
+    f.active_sprint(json!([{"key":"TEST-2","title":"Second","status":"todo","priority":"low"}]));
+    let output = f.run(&["once"], "success");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(f.read(".git/starts"), "TEST-2\n");
+    let commands = f.read(".git/hamstik-commands");
+    assert!(commands.contains("sprint list --all"));
+    let lists: Vec<_> = commands
+        .lines()
+        .filter(|line| line.starts_with("work list "))
+        .collect();
+    assert_eq!(
+        lists.len(),
+        1,
+        "no project-wide fallback when sprint work exists"
+    );
+    assert!(lists[0].contains(&format!("--sprint {SPRINT_ID} --all")));
+    assert!(lists[0].contains("--status todo --type task --type bug --type story --type feature"));
+    assert!(lists[0].contains("--label-name agent-ready"));
+}
+
+#[test]
+fn sprint_is_rechecked_after_completion_and_empty_sprint_falls_back() {
+    let f = Fixture::new();
+    f.active_sprint(json!([{"key":"TEST-2","title":"Second","status":"todo","priority":"low"}]));
+    f.write(".git/drain-sprint", SPRINT_ID);
+    let output = f.run(&["run", "--max-items", "2"], "success");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(f.read(".git/starts"), "TEST-2\nTEST-1\n");
+    assert_eq!(f.read(".git/closes"), "TEST-2\nTEST-1\n");
+    assert_eq!(f.state()["completedThisRun"], 2);
+    assert_eq!(
+        f.read(".git/hamstik-commands")
+            .matches("sprint list --all")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn preflight_requires_sprint_discovery_capability() {
+    let f = Fixture::new();
+    let mut manifest: Value = serde_json::from_str(&f.read(".git/manifest.json")).unwrap();
+    manifest["commands"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| entry["command"] != "hamstik sprint list");
+    f.write(".git/manifest.json", &manifest.to_string());
+    let output = f.run(&["once"], "success");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("required command `hamstik sprint list`")
+    );
+    assert!(!f.root().join(".git/starts").exists());
+}
+
+#[test]
+fn empty_sprint_and_no_active_sprint_fall_back_to_existing_selection() {
+    for active in [false, true] {
+        let f = Fixture::new();
+        if active {
+            f.active_sprint(json!([]));
+        } else {
+            f.write(
+                ".git/sprints.json",
+                &json!({"items":[
+                    {"id":"future","state":"future"},
+                    {"id":"done","state":"done"},
+                    {"id":"archived","state":"active","archivedAt":"2026-01-01"}
+                ]})
+                .to_string(),
+            );
+        }
+        assert!(f.run(&["once"], "success").status.success());
+        assert_eq!(f.read(".git/starts"), "TEST-1\n");
+        let commands = f.read(".git/hamstik-commands");
+        let lists: Vec<_> = commands
+            .lines()
+            .filter(|line| line.starts_with("work list "))
+            .collect();
+        assert_eq!(lists.len(), if active { 2 } else { 1 });
+        assert!(!lists.last().unwrap().contains("--sprint"));
+    }
+}
+
+#[test]
+fn skipped_and_cooling_sprint_items_allow_project_fallback() {
+    let f = Fixture::new();
+    f.active_sprint(json!([{"key":"TEST-1","title":"First","status":"todo","priority":"urgent"}]));
+    let output = f.run(&["run", "--max-items", "2"], "skip");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(f.read(".git/starts"), "TEST-1\nTEST-2\n");
+    assert_eq!(f.read(".git/closes"), "TEST-2\n");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No eligible active-sprint work"));
+    f.write(".git/starts", "");
+    assert!(f.run(&["once"], "skip").status.success());
+    assert_eq!(f.read(".git/starts"), "TEST-2\n");
+}
+
+#[test]
+fn sprint_api_errors_do_not_silently_select_project_work() {
+    for marker in [".git/sprint-error", ".git/sprint-items-error"] {
+        let f = Fixture::new();
+        f.active_sprint(json!([]));
+        f.write(marker, "fail");
+        assert!(!f.run(&["once"], "success").status.success());
+        assert!(!f.root().join(".git/starts").exists());
+        assert!(!f.root().join(".git/sessions").exists());
+    }
+}
+
+#[test]
+fn resumed_item_is_not_replaced_when_sprint_changes() {
+    let f = Fixture::new();
+    assert!(!f.run(&["once"], "rate-limit").status.success());
+    f.active_sprint(json!([{"key":"TEST-2","status":"todo","priority":"urgent"}]));
+    // Resume must not need sprint discovery at all.
+    f.write(".git/sprint-error", "fail");
+    assert!(f.run(&["resume"], "success").status.success());
+    assert_eq!(f.read(".git/starts"), "TEST-1\n");
+    assert_eq!(f.read(".git/closes"), "TEST-1\n");
+}
+
+#[test]
+fn multiple_active_sprints_share_the_existing_candidate_order() {
+    let f = Fixture::new();
+    let second = "22222222-2222-2222-2222-222222222222";
+    f.active_sprint(json!([{"key":"TEST-2","status":"todo","priority":"low"}]));
+    f.write(
+        ".git/sprints.json",
+        &json!({"items":[
+            {"id":SPRINT_ID,"state":"active"},{"id":second,"state":"active"}
+        ]})
+        .to_string(),
+    );
+    f.write(
+        &format!(".git/sprint-{second}.json"),
+        &json!({"items":[
+            {"key":"TEST-1","status":"todo","priority":"urgent"}
+        ]})
+        .to_string(),
+    );
+    assert!(f.run(&["once"], "success").status.success());
+    assert_eq!(f.read(".git/starts"), "TEST-1\n");
+    let commands = f.read(".git/hamstik-commands");
+    let lists: Vec<_> = commands
+        .lines()
+        .filter(|line| line.starts_with("work list "))
+        .collect();
+    assert_eq!(lists.len(), 2);
+    assert!(lists.iter().all(|line| line.contains("--sprint")));
 }

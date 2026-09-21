@@ -366,9 +366,20 @@ configure critical checks as commands/rules for a deterministic gate.
 ## Work Item selection
 
 Wheel intentionally does not use an LLM to decide what should be worked on
-next. Candidates are discovered with `hamstik work list --status … --type …
---label-name … --all` inside the Organization/Project resolved by the Hamstik
-CLI context, then ordered deterministically:
+next. Before each new selection, it discovers sprints with
+`hamstik sprint list --all` in the repository's Hamstik CLI Project context.
+Unarchived sprints whose server-reported state is `active` take precedence.
+Wheel queries their items with `hamstik work list --sprint <ID>`, retaining
+the configured status, type, and label filters and the existing skip/cooldown
+rules. If multiple sprints are active, their eligible items form one pool.
+
+If no sprint is active, or no eligible items remain in the active sprints,
+Wheel falls back to the existing project-wide query. A sprint discovery or
+item-query error stops selection; it is not treated as an empty sprint.
+An already active Wheel item continues from its checkpoint even if sprint
+membership changes.
+
+Within either pool, candidates are ordered deterministically:
 
 1. `in_progress` before backlog/todo when present in the candidate set;
 2. priority from highest to lowest (`urgent`/`critical`/`highest`, `high`,
@@ -546,6 +557,7 @@ machine-facing commands, always with the global `--no-input --json` flags:
 ```text
 hamstik doctor                       # dependency diagnostics before any agent runs
 hamstik commands                     # manifest check for the required command surface
+hamstik sprint list --all            # discover active sprints in the selected Project
 hamstik work list …                  # candidate discovery with configured filters
 hamstik work context <KEY>           # authoritative agent input
 hamstik work start <KEY>             # claim the Work Item
