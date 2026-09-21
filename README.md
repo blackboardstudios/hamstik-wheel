@@ -291,6 +291,8 @@ max_review_cycles = 3
 on_failure = "skip"
 agent_timeout_minutes = 45
 implement_retry = true
+provider_retries = 3
+provider_retry_delay_seconds = 30
 
 [git]
 require_clean_start = true
@@ -315,6 +317,9 @@ post_completed = true
 - **`[validation]`** — shell commands run from the repository root (`sh -lc`
   on Unix, `cmd /C` on Windows); every command must exit 0. With no commands
   configured, `doctor` warns that the final gate relies on review only.
+  Optional `[[validation.rules]]` add commands when changed paths match any
+  configured literal repository-relative prefix; rules are evaluated before
+  inspection and again before final validation, including new and deleted files.
 - **`[loop]`** — `max_items` bounds a `run` invocation when `--max-items` is
   omitted; `max_review_cycles` bounds review/remediation iterations per Work
   Item; `on_failure = "skip"` makes the run record the failure, restore the
@@ -322,12 +327,41 @@ post_completed = true
   (`"halt"` stops the run — the default); `agent_timeout_minutes` caps each
   agent session's wall-clock time (0 disables); `implement_retry` retries the
   implementation session once when it fails to produce a parsable result
-  marker.
+  marker. Provider errors use `provider_retries` (default 3 additional
+  sessions, maximum 10) and `provider_retry_delay_seconds` (default 30).
+  The delay doubles between retries, capped at 300 seconds. Set retries to
+  0 to stop immediately on a provider failure.
 - **`[git]`** — `require_clean_start` blocks new selection on a dirty working
   tree; `commit` controls whether Wheel commits; `commit_message` supports the
   `{key}` and `{title}` placeholders.
 - **`[comments]`** — post a comment when Wheel claims a Work Item and when it
   completes it.
+
+### Required checks for particular changes
+
+A passing generic precheck does not establish that database upgrades or other
+specialized behavior were tested. Configure those checks explicitly. For a
+repository with Drizzle migrations, for example (adapt commands to the
+repository and provide its test database):
+
+```toml
+[[validation.rules]]
+path_prefixes = ["drizzle/", "src/db/"]
+commands = ["pnpm migrations:test", "pnpm test:pg:ephemeral"]
+```
+
+Prefixes are literal, not globs: `drizzle/` matches that directory, and
+`src/db/schema.ts` matches paths beginning with that string. Commands are
+added to the base list once and must exit successfully at the final gate.
+Changes made during review activate rules too.
+
+Agents receive the validation configuration and must identify required
+checks that it omits. The result protocol includes `unverified_checks`;
+nonempty entries block completion even if the marker says `ready_for_review`
+or `pass`. An unavailable required check must be reported as blocked unless
+it is explicitly scheduled in Wheel's validation configuration. Wheel does
+not infer required checks by parsing repository prose or agent summaries;
+configure critical checks as commands/rules for a deterministic gate.
 
 ## Work Item selection
 
@@ -373,8 +407,10 @@ the pre-review validation evidence — rather than inheriting the implementer's
 assumptions. It is authorized to edit the working tree to fix findings, and it
 also ends with a structured marker: `pass` with zero findings, or `blocked`.
 
-Wheel parses only the final structured marker from each session's event
-stream; it does not read or interpret model reasoning for any other purpose.
+Wheel parses the structured result marker and terminal provider-error events
+from each session's event stream. Provider failures retain the configured
+model, resolved model, provider, and error details; they are not mislabeled
+as missing result markers. Model reasoning is not interpreted.
 
 ## Completion gates
 
@@ -404,43 +440,51 @@ that still reports findings is fed into the next remediation cycle, as is a
 nonzero final validation result. Every command must exit 0 at the final gate.
 Review/remediation repeats up to `max_review_cycles`; only an exhausted or
 blocked loop is reported as failed. Wheel then leaves the Work Item open and
-keeps its state persisted for inspection or `resume`.
+keeps its active state for `resume` in halt mode, or preserves WIP and skips
+the item in skip mode.
 
 ### Unattended runs
 
-`[loop].on_failure = "skip"` makes multi-item runs resilient: when an item
-fails (agent error/timeout, non-converging review, `blocked` result), Wheel
-posts a failure comment on the item, preserves the session's in-progress
-changes on a `wheel/wip/<KEY>` branch (when any exist), restores the working
-tree to that item's baseline, transitions the item back to `todo` so it
-stays eligible for later runs, and continues with the next item. The run
-summary reports how many items were skipped. Combined with
-`agent_timeout_minutes` (a hung session is killed at the wall-clock cap),
-`implement_retry` (one extra session when the first attempt emits no
-parsable result), and the review session's automatic single retry on
-transient failures (timeout/exit/lost output — an explicit `blocked` answer
-is never retried), a `run` can process a queue overnight: one bad item costs
-that item, not the whole night. Skipped items keep their failure comment
-and WIP branch for manual pickup or a later automated attempt.
+`[loop].on_failure = "skip"` records item-specific failures (process/protocol
+errors, timeouts, blocked results, or exhausted review), preserves changes on
+a `wheel/wip/<KEY>` branch, restores the baseline, and attempts to return the
+item to `todo`. That key is excluded for the rest of the run, so Wheel can
+select the next candidate. `max_items` counts completed plus skipped items.
 
-The skip path is crash-safe. Wheel persists a `Skipping` phase *before* it
-touches the working tree, so a process killed mid-cleanup (observed: a kill
-between the WIP commit and the baseline restore left an item claimed in
-`in_progress` forever, invisible to selection) is recovered automatically by
-the next `run`/`once`/`resume`: the remaining cleanup steps are completed
-idempotently and the item returns to the eligible pool.
+Across invocations, skipped items have a 30-minute cooldown. Changing the
+model named in a failure bypasses its cooldown; failures without a known
+model also cool down. Cooling items are filtered **before** selection, so
+they do not hide other candidates. When all candidates are excluded or
+cooling, the invocation finishes; it does not wait for cooldown expiry.
 
-Wheel keeps a small skip ledger in its state file (latest entry per item:
-failure classification and the model active at failure time). Selection uses
-it two ways:
+Provider outages are handled separately because every item using that model
+may be affected. Rate limits and transient provider errors receive bounded
+exponential retries. Authentication and other non-transient provider errors
+stop immediately. After provider retries are exhausted, Wheel stops with a
+nonzero exit **even with `on_failure = "skip"`**, retaining the active phase
+and working tree. Restore provider access or change the configured model,
+then run `hamstik-wheel resume`: a failed reviewer resumes review without
+repeating implementation or consuming another review cycle.
 
-- An item whose last failure was a timeout/exit of a model that is still
-  configured is deferred for a 30-minute cooldown instead of being
-  immediately re-failed — repeating a deterministic failure burns the run's
-  limit without changing the outcome.
-- A different-model or expired-cooldown re-selection logs the prior failure
-  so the re-attempt is visibly informed, and the loop stops (rather than
-  cycling) when the same item is skipped and immediately re-selected twice.
+Implementation process/protocol errors get one additional session when
+`implement_retry = true`; review process/protocol errors always get one.
+An explicit `blocked` result is not retried within the phase. Provider retry
+budgets apply independently of `implement_retry`.
+
+Wheel persists a `Skipping` phase before cleanup and recovers interrupted
+cleanup on the next invocation. The skip ledger records the exact WIP branch
+and commit. Future implementation prompts identify that commit, including
+suffixed branches such as `wheel/wip/<KEY>-2`. For old state without WIP
+metadata, Wheel discovers the highest numbered surviving branch. A skipped
+item is no longer active; `resume` applies to active checkpoints, while a
+later `run` or `once` can select skipped work after cooldown.
+
+Every agent attempt and validation report gets an immutable timestamped file
+under `.git/hamstik-wheel/logs/<KEY>/history/`. The usual `implement.log`,
+`review-NN.log`, and validation paths remain aliases containing the latest
+output. Failed final retries are retained as well as first attempts, and
+older aliases are archived before their first replacement. Use
+`--log-file <PATH>` to capture whole-run progress and terminal failure details.
 
 When the gates pass, Wheel commits with `git add -A` and the configured
 message template, records the commit SHA, and asks Hamstik CLI to close the

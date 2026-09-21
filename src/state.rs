@@ -36,6 +36,8 @@ pub struct ActiveWorkItem {
     pub baseline_sha: String,
     #[serde(default)]
     pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub validation_command_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +67,11 @@ pub struct SkipRecord {
     pub reason: String,
     /// Model that was active when the failure happened, when applicable.
     pub model: Option<String>,
+    /// Immutable commit identity and branch of the most recent saved work.
+    #[serde(default)]
+    pub wip_branch: Option<String>,
+    #[serde(default)]
+    pub wip_sha: Option<String>,
     pub skipped_at: DateTime<Utc>,
 }
 
@@ -201,6 +208,7 @@ mod tests {
             title: "Title".to_string(),
             baseline_sha: "abc".to_string(),
             commit_sha: None,
+            validation_command_count: 0,
         })
     }
 
@@ -242,6 +250,8 @@ mod tests {
             title: "One".into(),
             reason: "model-timeout".into(),
             model: Some("m1".into()),
+            wip_branch: None,
+            wip_sha: None,
             skipped_at: Utc::now(),
         });
         state.record_skip(SkipRecord {
@@ -249,6 +259,8 @@ mod tests {
             title: "Two".into(),
             reason: "git-commit".into(),
             model: None,
+            wip_branch: None,
+            wip_sha: None,
             skipped_at: Utc::now(),
         });
         state.record_skip(SkipRecord {
@@ -256,6 +268,8 @@ mod tests {
             title: "One".into(),
             reason: "review-failed".into(),
             model: Some("m2".into()),
+            wip_branch: None,
+            wip_sha: None,
             skipped_at: Utc::now(),
         });
         assert_eq!(state.skip_ledger.len(), 2);
@@ -275,6 +289,8 @@ mod tests {
             title: "Nine".into(),
             reason: "model-timeout".into(),
             model: Some("slow-model".into()),
+            wip_branch: None,
+            wip_sha: None,
             skipped_at: Utc::now(),
         });
         store.save(&mut state).unwrap();
@@ -302,6 +318,8 @@ mod tests {
                     title: "Title".into(),
                     reason: "implement-failed".into(),
                     model: Some("m".into()),
+                    wip_branch: None,
+                    wip_sha: None,
                     skipped_at: Utc::now(),
                 },
             )

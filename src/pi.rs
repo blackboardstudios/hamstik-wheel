@@ -23,6 +23,97 @@ pub struct AgentResult {
     pub summary: String,
     #[serde(default)]
     pub findings: Vec<String>,
+    /// Required checks the agent could not verify. A successful marker must
+    /// never hide these behind a prose-only caveat.
+    #[serde(default)]
+    pub unverified_checks: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct ProviderFailure {
+    pub configured_model: String,
+    pub resolved_model: String,
+    pub provider: String,
+    pub message: String,
+    pub rate_limited: bool,
+    pub retryable: bool,
+}
+
+impl std::fmt::Display for ProviderFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Pi model {} provider {} {} (resolved model {}): {}",
+            self.configured_model,
+            self.provider,
+            if self.rate_limited {
+                "rate-limited"
+            } else {
+                "request failed"
+            },
+            self.resolved_model,
+            self.message
+        )
+    }
+}
+
+impl std::error::Error for ProviderFailure {}
+
+/// Inspect terminal assistant events, not prompt/tool text. A successful later
+/// response supersedes errors from Pi's internal retry loop.
+fn provider_failure(output: &str, configured_model: &str) -> Option<ProviderFailure> {
+    for line in output.lines().rev() {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if event.get("type").and_then(Value::as_str) != Some("message_end") {
+            continue;
+        }
+        let Some(message) = event.get("message") else {
+            continue;
+        };
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if message.get("stopReason").and_then(Value::as_str) != Some("error") {
+            return None;
+        }
+        let detail = message
+            .get("errorMessage")
+            .and_then(Value::as_str)
+            .unwrap_or("provider returned an unspecified error");
+        let lower = detail.to_ascii_lowercase();
+        let rate_limited =
+            lower.contains("429") || lower.contains("rate-limit") || lower.contains("rate limit");
+        return Some(ProviderFailure {
+            configured_model: configured_model.to_string(),
+            resolved_model: message
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or(configured_model)
+                .to_string(),
+            provider: message
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            message: detail.to_string(),
+            rate_limited,
+            retryable: rate_limited
+                || [
+                    "500",
+                    "502",
+                    "503",
+                    "504",
+                    "overloaded",
+                    "timeout",
+                    "connection",
+                ]
+                .iter()
+                .any(|needle| lower.contains(needle)),
+        });
+    }
+    None
 }
 
 /// Outcome of one Pi invocation. The transcript is always captured so callers can
@@ -130,6 +221,8 @@ impl PiRunner {
         let status = child.wait().context("failed waiting for Pi")?;
         let result = if let Some(error) = write_error.or(wait_error) {
             Err(error)
+        } else if let Some(error) = provider_failure(&transcript, model) {
+            Err(error.into())
         } else if !status.success() {
             Err(anyhow!(
                 "Pi model {model} exited with status {:?}",
@@ -137,6 +230,7 @@ impl PiRunner {
             ))
         } else {
             parse_agent_result(&transcript)
+                .with_context(|| format!("Pi model {model} returned invalid result output"))
         };
 
         Ok(PiRun { result, transcript })
@@ -178,16 +272,17 @@ Your responsibilities:
 1. Inspect the existing repository architecture, conventions, tests, and relevant design documentation before editing.
 2. Implement the Work Item completely and satisfy every acceptance criterion.
 3. Add or update tests for changed behavior where appropriate.
-4. Run useful repository checks during implementation. Your session has a hard wall-clock limit: prefer targeted checks (`cargo check -p <crate>`) over the full precheck suite — Hamstik Wheel runs full validation after implementation.
+4. Run useful repository checks during implementation. Your session has a hard wall-clock limit: prefer targeted checks (`cargo check -p <crate>`) over the full precheck suite — Hamstik Wheel runs its configured validation commands after implementation.
 5. Keep changes scoped to this Work Item; do not rewrite unrelated behavior merely to make the task easier.
-6. Inspect any existing partial working-tree changes and continue them safely if this is a resumed run. A previous session's partial work may exist on a `wheel/wip/{key}` branch: inspect it read-only (`git log wheel/wip/{key}`, `git diff {baseline} wheel/wip/{key}`) and copy what is salvageable into your working tree. NEVER merge, checkout, rebase, or otherwise move branch refs — those are Hamstik Wheel's to manage.
+6. Inspect any existing partial working-tree changes and continue them safely if this is a resumed run. If a preserved-work commit is supplied below, inspect that exact commit read-only and copy what is salvageable. NEVER merge, checkout, rebase, or otherwise move branch refs — those are Hamstik Wheel's to manage.
 7. Do NOT change the Hamstik Work Item status, add Hamstik comments, or close the Work Item. Hamstik Wheel owns lifecycle.
 8. Do NOT create a Git commit. Leave the complete implementation in the working tree for independent review.
 9. If requirements are materially ambiguous/conflicting or safe completion is impossible, stop without inventing requirements.
+10. Identify validation required by repository instructions and the changed behavior (including populated database migrations and integration tests). Do not assume Wheel's generic prechecks include these. If a required check cannot run and is not explicitly scheduled in the Wheel validation commands supplied below, return blocked and list it in unverified_checks. Never hide unrun required checks in prose while returning ready_for_review.
 
 At the very end of your response output exactly one machine-readable line in one of these forms:
-HAMSTIK_WHEEL_RESULT={{"status":"ready_for_review","summary":"brief summary","findings":[]}}
-HAMSTIK_WHEEL_RESULT={{"status":"blocked","summary":"why work cannot safely continue","findings":["blocking reason"]}}
+HAMSTIK_WHEEL_RESULT={{"status":"ready_for_review","summary":"brief summary","findings":[],"unverified_checks":[]}}
+HAMSTIK_WHEEL_RESULT={{"status":"blocked","summary":"why work cannot safely continue","findings":["blocking reason"],"unverified_checks":["required check that could not run, if any"]}}
 
 Do not put Markdown fences around the marker line.
 "#,
@@ -218,7 +313,7 @@ HAMSTIK_CONTEXT_JSON:
 PREVIOUS_VALIDATION_EVIDENCE (digested; full untruncated output is in .git/hamstik-wheel/logs/{key}/ under Git metadata — read it from there if you need more detail):
 {validation_evidence}
 
-Budget your work: you have a hard session wall-clock limit. Inspect the diff (`git diff {baseline}`), read only the files it touches, and do not dump large outputs to the console.
+Budget your work: you have a hard session wall-clock limit. Inspect the diff (`git diff {baseline}`), read the files it touches and relevant dependencies, and do not dump large outputs to the console.
 
 Review for at least:
 - every requirement and acceptance criterion;
@@ -234,19 +329,19 @@ Review for at least:
 
 You are authorized to edit the working tree to fix every actionable finding. After fixes, review the resulting diff again. Continue until there are zero unresolved actionable findings or you determine safe completion is blocked.
 
-Work within a strict time budget — your session has a hard wall-clock limit and a previous review was killed mid-remediation. Therefore:
-- Inspect `git diff {baseline}` first; read only files the diff touches.
-- Do NOT run full-repository verification: never run precheck scripts, `cargo fmt --all`, `cargo clippy --workspace`, `cargo build --workspace --release`, or the whole test suite. Hamstik Wheel already ran full validation after implementation (see evidence below) and runs it again after your review. If a check you need would take the whole workspace, skip it and note it in your summary instead.
-- Use targeted checks only, at most 3 times total: `cargo check -p <touched-crate> --all-targets` or `cargo test -p <touched-crate> --test <relevant-test>`.
-- Prefer small, decisive fixes over exploratory loops. When you are more than halfway through your budget, stop fixing and emit the marker.
+Work within the session wall-clock limit:
+- Inspect `git diff {baseline}` first; read touched files and relevant dependencies.
+- Do NOT run full-repository verification: never run precheck scripts, `cargo fmt --all`, `cargo clippy --workspace`, `cargo build --workspace --release`, or the whole test suite. Hamstik Wheel runs the configured validation commands after implementation and again after your review. Do not treat a passing configured suite as evidence for checks it does not include. If a required check is absent from the supplied evidence and is not explicitly scheduled for final validation, return blocked with unverified_checks. Never return pass with required validation missing.
+- Prefer targeted checks: `cargo check -p <touched-crate> --all-targets` or `cargo test -p <touched-crate> --test <relevant-test>`.
+- Prefer small, decisive fixes over exploratory loops. If time expires before all requirements can be verified, emit a blocked marker with the unresolved findings.
 
 Do NOT change Hamstik Work Item status/comments and do NOT create a Git commit. Hamstik Wheel owns those actions.
 
 At the very end of your response output exactly one machine-readable line:
-HAMSTIK_WHEEL_RESULT={{"status":"pass","summary":"brief independent review summary","findings":[]}}
+HAMSTIK_WHEEL_RESULT={{"status":"pass","summary":"brief independent review summary","findings":[],"unverified_checks":[]}}
 
 If safe completion is impossible instead output:
-HAMSTIK_WHEEL_RESULT={{"status":"blocked","summary":"why review cannot pass","findings":["unresolved finding"]}}
+HAMSTIK_WHEEL_RESULT={{"status":"blocked","summary":"why review cannot pass","findings":["unresolved finding"],"unverified_checks":["required check that could not run, if any"]}}
 
 Return status `pass` only when there are zero unresolved actionable findings. Do not put Markdown fences around the marker line.
 "#,
@@ -437,6 +532,46 @@ fn unescape_json(escaped: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_errors_preserve_configured_and_resolved_model() {
+        let output = serde_json::json!({"type":"message_end", "message": {
+            "role":"assistant", "stopReason":"error", "provider":"gateway",
+            "model":"actual-model", "errorMessage":"429: upstream rate-limited"
+        }})
+        .to_string();
+        let failure = provider_failure(&output, "gateway/pattern").unwrap();
+        assert!(failure.rate_limited && failure.retryable);
+        assert_eq!(failure.configured_model, "gateway/pattern");
+        assert_eq!(failure.resolved_model, "actual-model");
+        assert!(failure.to_string().contains("429: upstream rate-limited"));
+    }
+
+    #[test]
+    fn successful_internal_retry_supersedes_provider_error() {
+        let error = serde_json::json!({"type":"message_end", "message": {
+            "role":"assistant", "stopReason":"error", "errorMessage":"429"
+        }});
+        let success = serde_json::json!({"type":"message_end", "message": {
+            "role":"assistant", "stopReason":"stop", "content":[{"type":"text", "text":"done"}]
+        }});
+        assert!(provider_failure(&format!("{error}\n{success}\n"), "m").is_none());
+        let tool = serde_json::json!({"type":"message_end", "message": {
+            "role":"toolResult", "stopReason":"error", "errorMessage":"429"
+        }});
+        assert!(provider_failure(&format!("{success}\n{tool}\n"), "m").is_none());
+    }
+
+    #[test]
+    fn authentication_errors_are_not_retried() {
+        let output = serde_json::json!({"type":"message_end", "message": {
+            "role":"assistant", "stopReason":"error", "errorMessage":"401: invalid API key"
+        }})
+        .to_string();
+        let failure = provider_failure(&output, "m").unwrap();
+        assert!(!failure.retryable);
+        assert!(!failure.rate_limited);
+    }
 
     #[test]
     fn parses_last_marker() {

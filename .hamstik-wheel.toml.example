@@ -26,17 +26,30 @@ commands = [
   "./scripts/do-prechecks.py",
 ]
 
+# Optional specialized gates. Literal repository-relative prefixes, not globs.
+# Every matched command must pass; rules are re-evaluated after review edits.
+# [[validation.rules]]
+# path_prefixes = ["drizzle/", "src/db/"]
+# commands = ["pnpm migrations:test", "pnpm test:pg:ephemeral"]
+
 [loop]
 max_items = 10
 max_review_cycles = 3
 # "skip": record the failure, restore the item's baseline tree, and continue
 # with the next Work Item. "halt": stop the run on the first failure (default).
+# Provider outages preserve the active checkpoint and stop after bounded retries
+# in either mode, so `resume` can continue the same phase.
 on_failure = "halt"
 # Wall-clock cap for each agent session, in minutes. 0 disables the cap.
 agent_timeout_minutes = 105
 # Retry the implementation session once when the first attempt fails to
 # produce a parsable result marker.
 implement_retry = false
+# Additional sessions for transient provider errors (0 disables; maximum 10).
+# Authentication failures stop immediately. Independent of implement_retry.
+provider_retries = 3
+# Initial retry delay; doubles each time, capped at 300 seconds.
+provider_retry_delay_seconds = 30
 
 [git]
 require_clean_start = true

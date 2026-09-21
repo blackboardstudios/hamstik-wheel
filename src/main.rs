@@ -74,7 +74,7 @@ enum Commands {
     Once,
     /// Process Work Items sequentially until the configured/requested limit or no work remains.
     Run {
-        /// Maximum number of Work Items to complete in this invocation.
+        /// Maximum number of Work Items to attempt (completed plus skipped).
         #[arg(long)]
         max_items: Option<usize>,
     },
@@ -100,7 +100,7 @@ fn run() -> Result<()> {
     };
     let logger = Logger::new(timestamps, cli.log_file.as_deref(), cli.verbose)
         .context("failed to initialize logging")?;
-    match cli.command {
+    let result = match cli.command {
         Commands::Init => {
             let repo = GitRepo::discover()?;
             let path = Config::init(repo.root())?;
@@ -114,5 +114,10 @@ fn run() -> Result<()> {
         Commands::Resume => LoopEngine::load_with_logger(&logger)?.resume(),
         Commands::Status => LoopEngine::load_with_logger(&logger)?.status(),
     }
-    .context("Hamstik Wheel command failed")
+    .context("Hamstik Wheel command failed");
+    if let Err(error) = &result {
+        // Include terminal failures in --log-file, not only terminal stderr.
+        logger.append_raw(&format!("error: {error:#}"));
+    }
+    result
 }

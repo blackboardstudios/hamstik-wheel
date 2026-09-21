@@ -70,6 +70,34 @@ impl Default for ModelsConfig {
 #[serde(default)]
 pub struct ValidationConfig {
     pub commands: Vec<String>,
+    pub rules: Vec<ValidationRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationRule {
+    /// Repository-relative literal prefixes (no glob syntax).
+    pub path_prefixes: Vec<String>,
+    pub commands: Vec<String>,
+}
+
+impl ValidationConfig {
+    pub fn commands_for_paths(&self, paths: &[String]) -> Vec<String> {
+        let mut commands = self.commands.clone();
+        for rule in &self.rules {
+            if paths.iter().any(|path| {
+                rule.path_prefixes
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix))
+            }) {
+                for command in &rule.commands {
+                    if !commands.contains(command) {
+                        commands.push(command.clone());
+                    }
+                }
+            }
+        }
+        commands
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -95,6 +123,11 @@ pub struct LoopConfig {
     /// One extra implementation attempt when the first session fails to
     /// produce a parsable result marker.
     pub implement_retry: bool,
+    /// Additional sessions for transient provider errors; independent of the
+    /// one retry for process/protocol failures.
+    pub provider_retries: usize,
+    /// Initial delay; doubles per provider retry, capped at five minutes.
+    pub provider_retry_delay_seconds: u64,
 }
 
 impl Default for LoopConfig {
@@ -105,6 +138,8 @@ impl Default for LoopConfig {
             on_failure: OnFailure::Halt,
             agent_timeout_minutes: 45,
             implement_retry: true,
+            provider_retries: 3,
+            provider_retry_delay_seconds: 30,
         }
     }
 }
@@ -193,6 +228,33 @@ impl Config {
         if self.r#loop.max_review_cycles == 0 {
             bail!("[loop].max_review_cycles must be greater than zero");
         }
+        if self.r#loop.provider_retries > 10 {
+            bail!("[loop].provider_retries must be at most 10");
+        }
+        for rule in &self.validation.rules {
+            if rule.path_prefixes.is_empty() || rule.commands.is_empty() {
+                bail!("validation rules require path_prefixes and commands");
+            }
+            for prefix in &rule.path_prefixes {
+                if prefix.trim().is_empty()
+                    || prefix.starts_with('/')
+                    || prefix.contains("..")
+                    || prefix.starts_with("./")
+                    || prefix.contains(['*', '?', '\\', ':'])
+                {
+                    bail!("validation path prefix `{prefix}` must be a repository-relative literal prefix");
+                }
+            }
+        }
+        if self
+            .validation
+            .commands
+            .iter()
+            .chain(self.validation.rules.iter().flat_map(|r| &r.commands))
+            .any(|command| command.trim().is_empty())
+        {
+            bail!("validation commands must not be empty");
+        }
         Ok(())
     }
 
@@ -212,6 +274,45 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_rules_add_required_commands_only_for_matching_paths() {
+        let parsed: Config = toml::from_str(
+            r#"
+[validation]
+commands = ["precheck"]
+[[validation.rules]]
+path_prefixes = ["drizzle/", "src/db/"]
+commands = ["precheck", "migration-test", "postgres-test"]
+"#,
+        )
+        .unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(
+            parsed
+                .validation
+                .commands_for_paths(&["docs/index.md".into()]),
+            vec!["precheck"]
+        );
+        assert_eq!(
+            parsed
+                .validation
+                .commands_for_paths(&["drizzle/0064.sql".into(), "src/db/schema.ts".into()]),
+            vec!["precheck", "migration-test", "postgres-test"]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_rules_and_unbounded_retry_count() {
+        for raw in [
+            "[[validation.rules]]\npath_prefixes = []\ncommands = ['test']",
+            "[[validation.rules]]\npath_prefixes = ['../drizzle']\ncommands = ['test']",
+            "[[validation.rules]]\npath_prefixes = ['drizzle/']\ncommands = ['']",
+            "[loop]\nprovider_retries = 11",
+        ] {
+            assert!(toml::from_str::<Config>(raw).unwrap().validate().is_err());
+        }
+    }
 
     #[test]
     fn defaults_match_initial_model_pair() {

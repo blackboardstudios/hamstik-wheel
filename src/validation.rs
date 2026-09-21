@@ -66,7 +66,7 @@ impl ValidationReport {
     /// context. The full output is available in the validation log file.
     pub fn evidence_digest(&self, max_chars_per_stream: usize) -> String {
         let mut out = format!(
-            "overall: {}. Full repository validation has ALREADY been run by Hamstik Wheel — do not re-run it; your job is diff review, not re-verification.\n(full untruncated output is saved in .git/hamstik-wheel/logs/<KEY>/pre-review-validation.log)\n",
+            "overall: {}. Only the configured commands listed below have been run by Hamstik Wheel. PASS does not establish that every repository-required check was included; identify missing required checks during review.\n(full untruncated output is saved in .git/hamstik-wheel/logs/<KEY>/pre-review-validation.log)\n",
             if self.passed { "PASS" } else { "FAIL" }
         );
         for item in &self.commands {

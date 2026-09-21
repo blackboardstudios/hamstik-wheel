@@ -71,6 +71,8 @@ max_review_cycles = 3
 on_failure = "halt"
 agent_timeout_minutes = 45
 implement_retry = true
+provider_retries = 3
+provider_retry_delay_seconds = 30
 
 [git]
 require_clean_start = true
@@ -350,19 +352,19 @@ Preflight and doctor verify the installed Pi supports `--mode json` and fail wit
 Agents MUST end with exactly one machine marker line:
 
 ```text
-HAMSTIK_WHEEL_RESULT={"status":"ready_for_review","summary":"...","findings":[]}
+HAMSTIK_WHEEL_RESULT={"status":"ready_for_review","summary":"...","findings":[],"unverified_checks":[]}
 ```
 
 Reviewer PASS:
 
 ```text
-HAMSTIK_WHEEL_RESULT={"status":"pass","summary":"...","findings":[]}
+HAMSTIK_WHEEL_RESULT={"status":"pass","summary":"...","findings":[],"unverified_checks":[]}
 ```
 
 Reviewer blocked/non-pass:
 
 ```text
-HAMSTIK_WHEEL_RESULT={"status":"blocked","summary":"...","findings":["..."]}
+HAMSTIK_WHEEL_RESULT={"status":"blocked","summary":"...","findings":["..."],"unverified_checks":[]}
 ```
 
 Wheel searches output from the end for the marker, parses the suffix as JSON, and rejects a missing/malformed marker.
@@ -412,6 +414,20 @@ The review prompt MUST say, in substance:
 ## 9. Validation
 
 Each configured command executes sequentially from repository root.
+`[[validation.rules]]` may add commands for matching `path_prefixes` (literal
+repository-relative prefixes, not globs). Rules inspect changed paths against
+the active baseline, including staged/unstaged edits, both sides of renames,
+deletions, and untracked files. They are re-evaluated after review so new
+migration or integration changes activate their gates. Duplicate rule commands
+are run once per validation phase.
+
+Both prompts receive the validation configuration. Agents must identify
+required checks omitted by it and report unavailable required checks in
+`unverified_checks`; a nonempty list blocks completion regardless of the
+reported status. Checks explicitly scheduled in Wheel's final validation may
+be deferred to that gate. A passing configured suite is not evidence for
+checks it does not include. Critical checks must be configured explicitly;
+Wheel does not infer commands from repository prose.
 
 Result model:
 
@@ -613,8 +629,18 @@ Start comment should be similarly concise.
 ## 15. Error handling
 
 By default, errors are fatal to the active loop (`[loop].on_failure = "halt"`).
-With `on_failure = "skip"`, a failed Work Item is handled as follows and the
-run continues with the next item:
+Provider request errors are extracted from terminal Pi assistant events before
+marker parsing. The configured model, resolved model, provider, and original
+error are preserved. Transient provider failures (including rate limits) use
+`provider_retries` additional sessions (default 3, maximum 10), starting with
+`provider_retry_delay_seconds` (default 30) and doubling to a 300-second cap.
+Authentication and other non-transient provider errors are not retried.
+After retry exhaustion, the active phase and working tree are retained and
+the command exits nonzero regardless of `on_failure`. `resume` continues the
+same phase/cycle; provider availability must not force reimplementation.
+
+With `on_failure = "skip"`, item-specific failures are handled as follows and
+the run continues with the next item:
 
 1. the failure is recorded in persisted state (`lastError`) and in a failure
    comment on the Work Item (idempotency-keyed, best-effort);
@@ -637,8 +663,10 @@ run continues with the next item:
    `in_progress` (best-effort; the item stays claimed only if the transition
    fails, which is logged);
 6. active state is cleared, the failure is appended to the per-item skip
-   ledger (failure classification + model active at failure), and the loop
-   advances.
+   ledger (failure classification, model active at failure, exact WIP branch
+   and commit), and the key is excluded for the rest of this run. Future
+   implementation prompts use the saved commit. Legacy state falls back to
+   the highest numbered existing WIP branch, tolerating deleted suffixes.
 
 Additional resilience controls:
 
@@ -651,17 +679,20 @@ Additional resilience controls:
   explicit `blocked` results and non-marker-producing retries are final.
 - Review sessions get one automatic retry on transient process failures
   (wall-clock timeout, abnormal exit, lost/unparsable output); an explicit
-  `blocked` review result is a considered answer and is never retried. The
-  failed first attempt's transcript is persisted as
-  `review-<NN>-attempt-01.log` before the retry.
-- Selection consults the skip ledger: an item whose latest skip was a
-  timeout/exit of a still-configured model is deferred for a 30-minute
-  cooldown (it stays in its current status and remains eligible), and any
-  re-selection of a previously skipped item logs the prior failure. The run
-  halts instead of cycling when the same item is skipped and immediately
-  re-selected.
-- `run` counts skipped items and reports them in the run summary; `once`
-  treats a skipped item as a completed outcome.
+  `blocked` result is never retried within the phase. Provider retries have
+  a separate budget and do not consume review cycles.
+- Every agent attempt (including failed final retries) and validation report
+  is written to an immutable timestamped file under `logs/<KEY>/history/`.
+  Stable per-phase filenames contain the latest output for compatibility;
+  existing legacy logs are archived before replacement. Fatal command errors
+  are included in an explicitly configured `--log-file`.
+- Selection filters excluded and cooling keys before ranking candidates.
+  Skips with an unchanged or unknown model cool down for 30 minutes across
+  invocations. Changing the recorded model bypasses cooldown. Other candidates
+  remain selectable; if all are cooling/excluded, the invocation ends.
+- `run` bounds completed plus skipped items by `max_items` and reports both;
+  `once` returns successfully for an item-specific skip, while provider outages
+  exit nonzero with a resumable active checkpoint.
 - `doctor` reports stranded `in_progress` items assigned to the
   authenticated user (invisible to selection) and `wheel/wip/<KEY>` branches
   already contained in `HEAD` (salvage candidates for deletion); `status`
@@ -694,7 +725,10 @@ Unit tests should cover:
 - commit-message expansion;
 - validation report pass/fail aggregation.
 
-Integration tests should later use fake executable scripts placed earlier in `PATH` for `hamstik`, `pi`, and optionally `git`, allowing the full loop to be tested without network/model calls.
+Integration tests in `tests/overnight.rs` use isolated temporary Git repositories
+and fake Hamstik/Pi executables. They exercise provider retry/recovery,
+checkpoint resume, skip/cooldown selection, WIP discovery, transcript retention,
+and required validation gates without network/model calls.
 
 ## 17. Release scope boundary
 

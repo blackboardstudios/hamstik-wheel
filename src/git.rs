@@ -41,7 +41,7 @@ impl GitRepo {
         &self.root
     }
 
-    fn run(&self, args: &[&str]) -> Result<String> {
+    fn run_raw(&self, args: &[&str]) -> Result<String> {
         let output = Command::new("git")
             .current_dir(&self.root)
             .args(args)
@@ -54,11 +54,40 @@ impl GitRepo {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+        Ok(String::from_utf8(output.stdout)?)
+    }
+
+    fn run(&self, args: &[&str]) -> Result<String> {
+        Ok(self.run_raw(args)?.trim().to_string())
     }
 
     pub fn head(&self) -> Result<String> {
         self.run(&["rev-parse", "HEAD"])
+    }
+
+    pub fn resolve_commit(&self, reference: &str) -> Result<String> {
+        self.run(&["rev-parse", "--verify", &format!("{reference}^{{commit}}")])
+    }
+
+    /// Includes staged, unstaged, deleted, renamed, and new files. Disable
+    /// rename detection so both sides of a move activate validation rules.
+    pub fn changed_paths(&self, baseline: &str) -> Result<Vec<String>> {
+        let mut paths = Vec::new();
+        for args in [
+            vec!["diff", "--name-only", "--no-renames", "-z", baseline, "--"],
+            vec!["ls-files", "--others", "--exclude-standard", "-z"],
+        ] {
+            let output = self.run_raw(&args)?;
+            paths.extend(
+                output
+                    .split('\0')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            );
+        }
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
     }
 
     pub fn is_clean(&self) -> Result<bool> {
@@ -234,16 +263,28 @@ impl GitRepo {
         // commit the anchor is done, otherwise append a numeric suffix
         // instead of failing the preservation run.
         let base = format!("wheel/wip/{}", sanitize_ref_component(key));
-        let branch = if self.branch_points_at(&base, &wip_sha) {
-            base
+        let existing = self.existing_wip_branches(key)?;
+        let branch = if let Some(branch) = existing
+            .iter()
+            .find(|branch| self.branch_points_at(branch, &wip_sha))
+        {
+            branch.clone()
         } else {
-            let mut candidate = base.clone();
-            let mut suffix = 2usize;
-            while self.ref_exists(&candidate) {
-                candidate = format!("{base}-{suffix}");
-                suffix += 1;
+            match existing.last() {
+                None => base,
+                Some(last) => {
+                    let suffix = last
+                        .strip_prefix(&format!("{base}-"))
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(1);
+                    format!(
+                        "{base}-{}",
+                        suffix
+                            .checked_add(1)
+                            .context("WIP branch suffix overflow")?
+                    )
+                }
             }
-            candidate
         };
 
         let branch_at = Command::new("git")
@@ -251,7 +292,7 @@ impl GitRepo {
             .args(["branch", branch.as_str(), wip_sha.as_str()])
             .output()
             .with_context(|| format!("failed to create WIP branch {branch}"))?;
-        if !branch_at.status.success() {
+        if !branch_at.status.success() && !self.branch_points_at(&branch, &wip_sha) {
             bail!(
                 "git branch {branch} failed: {}",
                 String::from_utf8_lossy(&branch_at.stderr).trim()
@@ -260,21 +301,6 @@ impl GitRepo {
 
         self.checkout_baseline(baseline_sha)?;
         Ok(Some(branch))
-    }
-
-    /// Whether a Git ref (branch or tag) with this exact name exists.
-    fn ref_exists(&self, ref_name: &str) -> bool {
-        Command::new("git")
-            .current_dir(&self.root)
-            .args([
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("{ref_name}^{{commit}}"),
-            ])
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
     }
 
     /// Whether a branch exists and points exactly at `sha`.
@@ -296,26 +322,29 @@ impl GitRepo {
 
     /// Name of the WIP branch `preserve_wip` would create for a key, plus any
     /// numeric-suffixed variants that already exist. Used by crash recovery
-    /// (was preservation interrupted?) and by doctor advisories. The base
-    /// branch is always included so callers can detect "preservation started
-    /// but the branch was not yet created".
+    /// (was preservation interrupted?) and by doctor advisories. Enumeration
+    /// tolerates deleted suffixes and sorts by creation sequence.
     pub fn existing_wip_branches(&self, key: &str) -> Result<Vec<String>> {
         let base = format!("wheel/wip/{}", sanitize_ref_component(key));
-        let mut branches = vec![base.clone()];
-        let mut suffix = 2usize;
-        loop {
-            let candidate = format!("{base}-{suffix}");
-            if self.ref_exists(&candidate) {
-                branches.push(candidate);
-                suffix += 1;
-            } else {
-                break;
-            }
-        }
-        Ok(branches
-            .into_iter()
-            .filter(|b| self.ref_exists(b))
-            .collect())
+        let prefix = format!("{base}-");
+        let output = self.run(&[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/wheel/wip/",
+        ])?;
+        let mut branches: Vec<_> = output
+            .lines()
+            .filter_map(|name| {
+                let suffix = if name == base {
+                    1
+                } else {
+                    name.strip_prefix(&prefix)?.parse::<usize>().ok()?
+                };
+                Some((suffix, name.to_string()))
+            })
+            .collect();
+        branches.sort_by_key(|(suffix, _)| *suffix);
+        Ok(branches.into_iter().map(|(_, name)| name).collect())
     }
 }
 
@@ -341,6 +370,36 @@ mod tests {
         assert_eq!(
             GitRepo::expand_commit_message("{key}: {title}", "HAM-42", "Do a thing"),
             "HAM-42: Do a thing"
+        );
+    }
+
+    #[test]
+    fn changed_paths_include_new_deleted_staged_and_renamed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = GitRepo::new(dir.path()).unwrap();
+        repo.run(&["init", "-q"]).unwrap();
+        repo.run(&["config", "user.email", "wheel@test"]).unwrap();
+        repo.run(&["config", "user.name", "wheel"]).unwrap();
+        repo.run(&["config", "commit.gpgsign", "false"]).unwrap();
+        for name in ["delete.sql", "rename.sql", "edit.sql"] {
+            std::fs::write(dir.path().join(name), "original\n").unwrap();
+        }
+        repo.run(&["add", "-A"]).unwrap();
+        repo.run(&["commit", "-qm", "base"]).unwrap();
+        let baseline = repo.head().unwrap();
+        std::fs::remove_file(dir.path().join("delete.sql")).unwrap();
+        repo.run(&["mv", "rename.sql", "renamed.sql"]).unwrap();
+        std::fs::write(dir.path().join("edit.sql"), "changed\n").unwrap();
+        std::fs::write(dir.path().join(" leading space.sql"), "new\n").unwrap();
+        assert_eq!(
+            repo.changed_paths(&baseline).unwrap(),
+            vec![
+                " leading space.sql",
+                "delete.sql",
+                "edit.sql",
+                "rename.sql",
+                "renamed.sql"
+            ]
         );
     }
 

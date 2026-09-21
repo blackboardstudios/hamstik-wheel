@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
+    collections::HashSet,
     fs,
+    io::Write,
     path::PathBuf,
     process::{Command, Stdio},
 };
@@ -14,7 +16,7 @@ use crate::{
     git::GitRepo,
     hamstik::{select_next, HamstikCli},
     logging::Logger,
-    pi::{implementation_prompt, review_prompt, PiRunner},
+    pi::{implementation_prompt, review_prompt, PiRunner, ProviderFailure},
     state::{ActiveWorkItem, Phase, SkipRecord, StateStore, WheelState},
     validation::{run_all, ValidationKind},
 };
@@ -190,13 +192,14 @@ impl LoopEngine {
             }
         }
 
-        if self.config.validation.commands.is_empty() {
+        if self.config.validation.commands.is_empty() && self.config.validation.rules.is_empty() {
             self.logger
                 .warn("! No validation commands configured; final gate will rely on review only");
         } else {
             self.logger.info(&format!(
-                "✓ {} validation command(s) configured",
-                self.config.validation.commands.len()
+                "✓ {} base validation command(s), {} conditional rule(s) configured",
+                self.config.validation.commands.len(),
+                self.config.validation.rules.len()
             ));
         }
 
@@ -267,6 +270,12 @@ impl LoopEngine {
                         .unwrap_or_default(),
                     record.skipped_at.format("%Y-%m-%dT%H:%M:%SZ"),
                 ));
+                if let Some(sha) = &record.wip_sha {
+                    self.logger.info(&format!(
+                        "    preserved: {} ({sha})",
+                        record.wip_branch.as_deref().unwrap_or("commit")
+                    ));
+                }
             }
         }
         Ok(())
@@ -286,12 +295,11 @@ impl LoopEngine {
 
         let mut completed = 0usize;
         let mut skipped = 0usize;
-        let mut last_skipped_key: Option<String> = None;
+        let mut excluded = HashSet::new();
         while completed + skipped < limit {
-            match self.process_one()? {
+            match self.process_one(&mut excluded)? {
                 ProcessOutcome::Completed => {
                     completed += 1;
-                    last_skipped_key = None;
                     self.logger.blank();
                     self.logger
                         .info(&format!("Completed {completed}/{limit} Work Item(s)."));
@@ -303,31 +311,6 @@ impl LoopEngine {
                 }
                 ProcessOutcome::Skipped => {
                     skipped += 1;
-                    // Guard against a skip loop: if the same item is selected
-                    // and skipped again immediately (it was just returned to
-                    // todo and is still the first candidate), halting is the
-                    // only safe move - continuing would burn the run's limit
-                    // re-failing one item. The skip ledger records the key at
-                    // skip time, so compare against that (the active item is
-                    // already cleared by the time we get here).
-                    if let Some(record) = self.store.load().ok().and_then(|state| {
-                        state
-                            .skip_ledger
-                            .last()
-                            .filter(|record| {
-                                record.skipped_at
-                                    > chrono::Utc::now() - chrono::Duration::minutes(5)
-                            })
-                            .cloned()
-                    }) {
-                        if last_skipped_key.as_deref() == Some(record.key.as_str()) {
-                            bail!(
-                                "item {} was skipped and immediately re-selected; the failure is deterministic (e.g. a claim-time error), so the run stops instead of cycling. Investigate the item's comments and state.",
-                                record.key
-                            );
-                        }
-                        last_skipped_key = Some(record.key.clone());
-                    }
                     self.logger.blank();
                     self.logger.info(&format!(
                         "Skipped {skipped}/{limit} Work Item(s) after failure; continuing (on_failure = skip)."
@@ -349,7 +332,7 @@ impl LoopEngine {
 
     pub fn once(&self) -> Result<()> {
         self.preflight()?;
-        match self.process_one()? {
+        match self.process_one(&mut HashSet::new())? {
             ProcessOutcome::Completed | ProcessOutcome::Skipped => Ok(()),
             ProcessOutcome::NoWork => {
                 self.logger.info("No eligible Hamstik Work Items found.");
@@ -395,14 +378,16 @@ impl LoopEngine {
         Ok(())
     }
 
-    fn process_one(&self) -> Result<ProcessOutcome> {
+    fn process_one(&self, excluded: &mut HashSet<String>) -> Result<ProcessOutcome> {
         let mut state = self.store.load()?;
 
         // Recovery first: a previous invocation may have crashed between
         // "skip requested" and "skip finished". Complete that cleanup before
         // anything else so the item is never stranded in `in_progress`.
         if state.phase == Phase::Skipping {
+            let key = state.current.as_ref().unwrap().key.clone();
             self.recover_interrupted_skip(&mut state)?;
+            excluded.insert(key);
             state = self.store.load()?;
         }
 
@@ -410,35 +395,29 @@ impl LoopEngine {
             if self.config.git.require_clean_start && !self.repo.is_clean()? {
                 bail!("working tree is dirty; finish/stash existing work before Hamstik Wheel selects a new Work Item");
             }
-            let candidates = self.hamstik.list_candidates(
+            let mut candidates = self.hamstik.list_candidates(
                 &self.config.hamstik.statuses,
                 &self.config.hamstik.item_types,
                 &self.config.hamstik.label_names,
             )?;
+            candidates.retain(|item| {
+                if excluded.contains(&item.key) {
+                    return false;
+                }
+                if let Some(record) = state.last_skip(&item.key) {
+                    if self.skip_is_cooling(record) {
+                        self.logger.info(&format!(
+                            "[select] {} cooling down after {}; considering other candidates",
+                            item.key, record.reason
+                        ));
+                        return false;
+                    }
+                }
+                true
+            });
             let Some(item) = select_next(candidates) else {
                 return Ok(ProcessOutcome::NoWork);
             };
-            // Selection backoff: an item whose most recent skip was caused by
-            // the currently configured model(s) re-fails deterministically.
-            // Cool it down instead of burning the run's limit on it.
-            if let Some(record) = state.last_skip(&item.key) {
-                if self.skip_would_repeat(record) {
-                    if let Some(cooled) = self.defer_repeated_skip(&item, record)? {
-                        return Ok(cooled);
-                    }
-                } else {
-                    self.logger.warn(&format!(
-                        "[select] {} previously failed with `{}`{}; re-selecting with a different model configuration",
-                        item.key,
-                        record.reason,
-                        record
-                            .model
-                            .as_deref()
-                            .map(|model| format!(" (model `{model}`)"))
-                            .unwrap_or_default()
-                    ));
-                }
-            }
             let baseline = self.repo.head()?;
             self.logger
                 .info(&format!("Selected {} — {}", item.key, item.title));
@@ -447,6 +426,7 @@ impl LoopEngine {
                 title: item.title,
                 baseline_sha: baseline,
                 commit_sha: None,
+                validation_command_count: 0,
             });
             state.phase = Phase::Selected;
             state.review_cycle = 0;
@@ -458,6 +438,12 @@ impl LoopEngine {
             let error_text = format!("{error:#}");
             state.last_error = Some(error_text.clone());
             let _ = self.store.save(&mut state);
+
+            // Provider availability affects every item using this model. Preserve
+            // the exact phase and tree instead of throwing away completed work.
+            if error.downcast_ref::<ProviderFailure>().is_some() {
+                return Err(error.context("provider unavailable; active checkpoint preserved; run `hamstik-wheel resume` after restoring provider access"));
+            }
 
             if self.config.r#loop.on_failure == config::OnFailure::Skip {
                 let Some(active) = state.current.as_ref() else {
@@ -487,17 +473,21 @@ impl LoopEngine {
                 }
 
                 self.record_skip_comment(&key, &title, &baseline, &error_text)?;
+                let (wip_branch, wip_sha) = self.latest_wip(&key)?;
                 let record = SkipRecord {
                     key: key.clone(),
                     title: title.clone(),
                     reason: classify_failure(&error_text),
                     model: active_model(&error_text),
+                    wip_branch,
+                    wip_sha,
                     skipped_at: chrono::Utc::now(),
                 };
                 self.store.finish_skip(&mut state, record)?;
                 self.logger.info(&format!(
                     "[skip] {key} recorded; item returned to the eligible pool; continuing"
                 ));
+                excluded.insert(key);
                 return Ok(ProcessOutcome::Skipped);
             }
             return Err(error);
@@ -506,45 +496,25 @@ impl LoopEngine {
         Ok(ProcessOutcome::Completed)
     }
 
-    /// Whether re-selecting the skipped item would deterministically repeat
-    /// the failure: the recorded failure names the model timeout/exit of a
-    /// model that is still the configured one for the same role.
-    fn skip_would_repeat(&self, record: &SkipRecord) -> bool {
-        let Some(model) = record.model.as_deref() else {
-            return false;
-        };
-        model == self.config.models.implement || model == self.config.models.review
+    fn skip_is_cooling(&self, record: &SkipRecord) -> bool {
+        let same_model = record
+            .model
+            .as_deref()
+            .map(|model| {
+                model == self.config.models.implement || model == self.config.models.review
+            })
+            .unwrap_or(true);
+        same_model && chrono::Utc::now() - record.skipped_at < chrono::Duration::minutes(30)
     }
 
-    /// Defer an item whose last failure would repeat under the current model
-    /// configuration. Returns Ok(Some(outcome)) when the item was deferred,
-    /// Ok(None) when the cooldown expired and selection should proceed.
-    fn defer_repeated_skip(
-        &self,
-        item: &crate::hamstik::WorkItemSummary,
-        record: &SkipRecord,
-    ) -> Result<Option<ProcessOutcome>> {
-        const COOLDOWN_MINUTES: i64 = 30;
-        let elapsed = chrono::Utc::now() - record.skipped_at;
-        if elapsed < chrono::Duration::minutes(COOLDOWN_MINUTES) {
-            let remaining = chrono::Duration::minutes(COOLDOWN_MINUTES) - elapsed;
-            self.logger.warn(&format!(
-                "[select] {} deferred {}m: last failure `{}` (model `{}` still configured); it stays in `{}` and stays eligible",
-                item.key,
-                remaining.num_minutes().max(1),
-                record.reason,
-                record.model.as_deref().unwrap_or_default(),
-                item.status,
-            ));
-            return Ok(Some(ProcessOutcome::NoWork));
+    fn latest_wip(&self, key: &str) -> Result<(Option<String>, Option<String>)> {
+        match self.repo.existing_wip_branches(key)?.pop() {
+            Some(branch) => {
+                let sha = self.repo.resolve_commit(&branch)?;
+                Ok((Some(branch), Some(sha)))
+            }
+            None => Ok((None, None)),
         }
-        self.logger.warn(&format!(
-            "[select] {} cooldown expired ({}m since last `{}` failure); re-selecting",
-            item.key,
-            elapsed.num_minutes(),
-            record.reason,
-        ));
-        Ok(None)
     }
 
     /// Finish a skip whose cleanup was interrupted by a crash. The persisted
@@ -580,11 +550,14 @@ impl LoopEngine {
                 .unwrap_or_else(|| "interrupted skip cleanup".to_string()),
         );
         self.record_skip_comment(&key, &title, &baseline, &error_text)?;
+        let (wip_branch, wip_sha) = self.latest_wip(&key)?;
         let record = SkipRecord {
             key: key.clone(),
             title,
             reason: "interrupted-cleanup".to_string(),
             model: active_model(&error_text),
+            wip_branch,
+            wip_sha,
             skipped_at: chrono::Utc::now(),
         };
         self.store.finish_skip(state, record)?;
@@ -689,14 +662,23 @@ impl LoopEngine {
                 "[implement] {} with {}",
                 current.key, self.config.models.implement
             ));
-            let prompt = implementation_prompt(
+            let mut prompt = implementation_prompt(
                 &current.key,
                 &current.title,
                 &current.baseline_sha,
                 &context,
             );
+            let (branch, sha) = match state.last_skip(&current.key) {
+                Some(record) if record.wip_sha.is_some() => {
+                    (record.wip_branch.clone(), record.wip_sha.clone())
+                }
+                _ => self.latest_wip(&current.key)?,
+            };
+            if let Some(sha) = sha {
+                prompt.push_str(&format!("\nLatest preserved work: commit {sha}, branch {}. Inspect this exact commit read-only and salvage it; do not assume the unsuffixed WIP branch is current.\n", branch.as_deref().unwrap_or("(recorded in state)")));
+            }
+            prompt.push_str(&format!("\nWHEEL_VALIDATION_CONFIG (base commands always run; rules apply when changed paths match their literal prefixes):\n{}\n", serde_json::to_string_pretty(&self.config.validation)?));
             let run = self.run_implement_session(&current.key, &prompt)?;
-            self.write_log(&current.key, "implement.log", &run.transcript)?;
             let result = run.result.with_context(|| {
                 format!(
                     "implementation agent failed; transcript: '{}'; state preserved, run `hamstik-wheel resume` to continue {}",
@@ -704,6 +686,12 @@ impl LoopEngine {
                     current.key
                 )
             })?;
+            if !result.unverified_checks.is_empty() {
+                bail!(
+                    "implementation blocked: required validation remains unverified: {}",
+                    result.unverified_checks.join("; ")
+                );
+            }
             match result.status.as_str() {
                 "ready_for_review" => {}
                 "blocked" => bail!("implementation blocked: {}", result.summary),
@@ -720,9 +708,10 @@ impl LoopEngine {
             let (mut evidence, mut review_tag) = if state.phase == Phase::PreReviewValidation {
                 self.logger.blank();
                 self.logger.info("[inspect] pre-review checks");
+                let commands = self.validation_commands(&current.baseline_sha)?;
                 let report = run_all(
                     self.repo.root(),
-                    &self.config.validation.commands,
+                    &commands,
                     &self.logger,
                     ValidationKind::Inspection,
                 )?;
@@ -761,7 +750,7 @@ impl LoopEngine {
                     "[{review_tag}] cycle {cycle}/{} with {}",
                     self.config.r#loop.max_review_cycles, self.config.models.review
                 ));
-                let prompt = review_prompt(
+                let mut prompt = review_prompt(
                     &current.key,
                     &current.title,
                     &current.baseline_sha,
@@ -769,21 +758,9 @@ impl LoopEngine {
                     &evidence,
                     cycle,
                 );
+                prompt.push_str(&format!("\nWHEEL_VALIDATION_CONFIG (re-evaluated against changed paths at final validation):\n{}\n", serde_json::to_string_pretty(&self.config.validation)?));
                 let review_log = format!("review-{cycle:02}.log");
-                let run = match self.run_review_session(&current.key, &review_log, &prompt) {
-                    Ok(run) => run,
-                    Err(error) => {
-                        // run_review_session returns an error only when the
-                        // failure is non-transient or the retry also failed;
-                        // a failed first attempt's transcript is persisted by
-                        // the retry path as review-NN-attempt-01.log.
-                        return Err(error.context(format!(
-                            "review agent failed (cycle {cycle}); state preserved, run `hamstik-wheel resume` to continue {}",
-                            current.key
-                        )));
-                    }
-                };
-                self.write_log(&current.key, &review_log, &run.transcript)?;
+                let run = self.run_review_session(&current.key, &review_log, &prompt)?;
                 let review = run.result.with_context(|| {
                     format!(
                         "review agent failed (cycle {cycle}); transcript: '{}'; state preserved, run `hamstik-wheel resume` to continue {}",
@@ -791,6 +768,12 @@ impl LoopEngine {
                         current.key
                     )
                 })?;
+                if !review.unverified_checks.is_empty() {
+                    bail!(
+                        "review blocked: required validation remains unverified: {}",
+                        review.unverified_checks.join("; ")
+                    );
+                }
                 if review.status == "blocked" {
                     bail!("review blocked: {}", review.summary);
                 }
@@ -831,9 +814,10 @@ impl LoopEngine {
                 self.logger.blank();
                 self.logger
                     .info(&format!("[validate] final checks for cycle {cycle}"));
+                let commands = self.validation_commands(&current.baseline_sha)?;
                 let final_report = run_all(
                     self.repo.root(),
-                    &self.config.validation.commands,
+                    &commands,
                     &self.logger,
                     ValidationKind::Final,
                 )?;
@@ -844,6 +828,7 @@ impl LoopEngine {
                     &final_evidence,
                 )?;
                 if final_report.passed {
+                    state.current.as_mut().unwrap().validation_command_count = commands.len();
                     self.logger.info("[validate] Final validation passed.");
                     passed = true;
                     break;
@@ -938,7 +923,7 @@ impl LoopEngine {
                     &self.config.models.implement,
                     &self.config.models.review,
                     state.review_cycle,
-                    self.config.validation.commands.len(),
+                    state.current.as_ref().unwrap().validation_command_count,
                 );
                 let idem = comment_idempotency_key("complete", &current.key, &current.baseline_sha);
                 // Advisory like the start comment: never fail a completed item
@@ -983,15 +968,60 @@ impl LoopEngine {
         )
     }
 
+    fn validation_commands(&self, baseline: &str) -> Result<Vec<String>> {
+        Ok(self
+            .config
+            .validation
+            .commands_for_paths(&self.repo.changed_paths(baseline)?))
+    }
+
     fn log_path(&self, key: &str, name: &str) -> PathBuf {
         self.logs_root.join(sanitize_component(key)).join(name)
     }
 
-    fn write_log(&self, key: &str, name: &str, content: &str) -> Result<()> {
+    /// Keep an immutable copy of every attempt; the original path remains a
+    /// convenient latest-output alias for humans and review prompts.
+    fn write_log(&self, key: &str, name: &str, content: &str) -> Result<PathBuf> {
         let path = self.log_path(key, name);
-        fs::create_dir_all(path.parent().context("log path has no parent directory")?)?;
-        fs::write(path, content)?;
-        Ok(())
+        let history = path
+            .parent()
+            .context("log path has no parent directory")?
+            .join("history");
+        fs::create_dir_all(&history)?;
+        // Preserve transcripts written by older Wheel versions before replacing
+        // their latest-output alias for the first time.
+        if path.exists() {
+            let legacy = history.join(format!("legacy-{name}"));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(legacy)
+            {
+                Ok(mut file) => {
+                    file.write_all(&fs::read(&path)?)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ");
+        for sequence in 0.. {
+            let archive = history.join(format!("{stamp}-{sequence}-{name}"));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&archive)
+            {
+                Ok(mut file) => {
+                    file.write_all(content.as_bytes())?;
+                    fs::write(&path, content)?;
+                    return Ok(archive);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!()
     }
 
     fn agent_timeout(&self) -> Option<std::time::Duration> {
@@ -999,79 +1029,86 @@ impl LoopEngine {
         (minutes > 0).then(|| std::time::Duration::from_secs(minutes * 60))
     }
 
-    fn run_agent(&self, model: &str, prompt: &str) -> Result<crate::pi::PiRun> {
-        self.pi
-            .run(model, prompt, self.agent_timeout(), &self.logger)
-    }
-
-    /// Run one implementation session, with an optional single automatic
-    /// retry when the first session fails to produce a parsable result
-    /// marker (process errors and timeouts are also retried once; explicit
-    /// `blocked` results never are).
     fn run_implement_session(&self, key: &str, prompt: &str) -> Result<crate::pi::PiRun> {
-        let mut run = self.run_agent(&self.config.models.implement, prompt)?;
-        if run.result.is_err() && self.config.r#loop.implement_retry {
-            // Persist the first attempt under its own name BEFORE the retry,
-            // so the caller's implement.log write cannot overwrite it (the
-            // final run may be the retry, and the first transcript is
-            // otherwise lost - observed on CLI-54 and CLI-9).
-            self.write_log(key, "implement-attempt-01.log", &run.transcript)?;
-            self.logger.warn(&format!(
-                "[implement] {key}: first session did not produce a parsable result; retrying once"
-            ));
-            let retry = self.run_agent(&self.config.models.implement, prompt)?;
-            if retry.result.is_ok() {
-                run = retry;
-            } else {
-                return Err(run
-                    .result
-                    .err()
-                    .map(|error| {
-                        anyhow::anyhow!(error.to_string())
-                            .context("implementation agent failed (after one retry)")
-                    })
-                    .unwrap_or_else(|| {
-                        anyhow::anyhow!("implementation agent failed (after one retry)")
-                    }));
-            }
-        }
-        Ok(run)
+        self.run_agent_session(
+            key,
+            "implement.log",
+            &self.config.models.implement,
+            prompt,
+            self.config.r#loop.implement_retry,
+        )
     }
 
-    /// Run one review session, with a single automatic retry on transient
-    /// process failures (timeout/exit/no-marker). An explicit `blocked`
-    /// result is a considered answer, not a transient failure, and is never
-    /// retried. Observed: a review-model wall-clock timeout at cycle 1 cost
-    /// the whole item even though a fresh session succeeds routinely. The
-    /// first attempt's transcript is persisted before the retry so it is
-    /// never overwritten or lost.
-    fn run_review_session(
+    fn run_review_session(&self, key: &str, log: &str, prompt: &str) -> Result<crate::pi::PiRun> {
+        self.run_agent_session(key, log, &self.config.models.review, prompt, true)
+    }
+
+    fn run_agent_session(
         &self,
         key: &str,
-        review_log: &str,
+        log: &str,
+        model: &str,
         prompt: &str,
+        retry_process: bool,
     ) -> Result<crate::pi::PiRun> {
-        let run = self.run_agent(&self.config.models.review, prompt)?;
-        match run.result {
-            Err(first_error) => {
-                let first_text = first_error.to_string();
-                if !is_transient_agent_failure(&first_text) {
-                    return Err(first_error.context("review agent failed"));
-                }
-                let attempt_log = review_log.replace(".log", "-attempt-01.log");
-                self.write_log(key, &attempt_log, &run.transcript)?;
-                self.logger.warn(&format!(
-                    "[review] {key}: review session failed transiently ({first_text}); retrying once"
-                ));
-                let retry = self.run_agent(&self.config.models.review, prompt)?;
-                match retry.result {
-                    Ok(_) => Ok(retry),
-                    Err(second_error) => Err(second_error.context(format!(
-                        "review agent failed (after one retry; first failure: {first_text})"
-                    ))),
+        let mut provider_retries = 0;
+        let mut process_retried = false;
+        loop {
+            let mut run = match self
+                .pi
+                .run(model, prompt, self.agent_timeout(), &self.logger)
+            {
+                Ok(run) => run,
+                Err(error) => crate::pi::PiRun {
+                    transcript:
+                        serde_json::json!({"type": "wheel_error", "error": format!("{error:#}")})
+                            .to_string(),
+                    result: Err(error),
+                },
+            };
+            let path = self.write_log(key, log, &run.transcript)?;
+            self.logger
+                .info(&format!("[agent] {key} transcript: {}", path.display()));
+            match run.result {
+                Ok(_) => return Ok(run),
+                Err(error) => {
+                    let retry = if let Some(provider) = error.downcast_ref::<ProviderFailure>() {
+                        if provider.retryable
+                            && provider_retries < self.config.r#loop.provider_retries
+                        {
+                            let delay = self
+                                .config
+                                .r#loop
+                                .provider_retry_delay_seconds
+                                .saturating_mul(1u64 << provider_retries)
+                                .min(300);
+                            provider_retries += 1;
+                            self.logger.warn(&format!("[retry] {key}: {error:#}; provider retry {provider_retries}/{} in {delay}s", self.config.r#loop.provider_retries));
+                            std::thread::sleep(std::time::Duration::from_secs(delay));
+                            true
+                        } else {
+                            false
+                        }
+                    } else if retry_process
+                        && !process_retried
+                        && is_transient_agent_failure(&format!("{error:#}"))
+                    {
+                        process_retried = true;
+                        self.logger
+                            .warn(&format!("[retry] {key}: {error:#}; retrying agent once"));
+                        true
+                    } else {
+                        false
+                    };
+                    if !retry {
+                        run.result = Err(error.context(format!(
+                            "agent session failed; transcript: {}",
+                            path.display()
+                        )));
+                        return Ok(run);
+                    }
                 }
             }
-            Ok(_) => Ok(run),
         }
     }
 
@@ -1249,6 +1286,8 @@ fn is_transient_agent_failure(error_text: &str) -> bool {
 /// comment and logs carry the details).
 fn classify_failure(error_text: &str) -> String {
     const RULES: &[(&str, &str)] = &[
+        ("rate-limited", "provider-rate-limit"),
+        ("request failed (resolved model", "provider-error"),
         ("exceeded the session timeout", "model-timeout"),
         ("HAMSTIK_WHEEL_RESULT", "no-result-marker"),
         ("git commit failed", "git-commit"),
