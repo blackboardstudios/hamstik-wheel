@@ -14,9 +14,12 @@ item_types = ["task", "bug", "story", "feature"]
 label_names = []
 
 [models]
-# Any model identifier/pattern Pi can resolve is valid. If a bare pattern
-# matches multiple authenticated providers, use a provider-qualified id
-# like "provider/model" (check with: pi --list-models <pattern>).
+# Any model identifier/pattern Pi can resolve is valid. Prefer the full
+# catalog id exactly as shown by `pi --list-models <pattern>`: a partial
+# pattern that matches several models (including variant suffixes like
+# OpenRouter's `:batch`) is resolved by Pi's fuzzy match, which can pick a
+# different model than intended. A provider-qualified full id like
+# "openrouter/z-ai/glm-5.3-flash" always resolves exactly.
 implement = "step-3.7-flash"
 review = "glm-5.3-flash"
 

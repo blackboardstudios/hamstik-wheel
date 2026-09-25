@@ -61,7 +61,7 @@ impl std::error::Error for ProviderFailure {}
 
 /// Inspect terminal assistant events, not prompt/tool text. A successful later
 /// response supersedes errors from Pi's internal retry loop.
-fn provider_failure(output: &str, configured_model: &str) -> Option<ProviderFailure> {
+pub(crate) fn provider_failure(output: &str, configured_model: &str) -> Option<ProviderFailure> {
     for line in output.lines().rev() {
         let Ok(event) = serde_json::from_str::<Value>(line) else {
             continue;

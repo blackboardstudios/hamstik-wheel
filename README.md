@@ -313,7 +313,13 @@ post_completed = true
   are excluded by default because Wheel should execute actionable child work.
 - **`[models]`** — the two Pi models. Any model identifier Pi can resolve may
   be configured; `step-3.7-flash` and `glm-5.3-flash` are the defaults from
-  the original local workflow, not requirements imposed by Hamstik.
+  the original local workflow, not requirements imposed by Hamstik. Prefer
+  the full catalog id exactly as listed by `pi --list-models <pattern>` (for
+  OpenRouter that is `openrouter/vendor/model`): a partial pattern matching
+  several models is resolved by Pi's fuzzy match, which can silently pick a
+  variant like `:batch` that fails every request. Doctor and preflight probe
+  both models with a tiny real request and stop the run on non-retryable
+  provider errors (wrong model, authentication) before any Work Item starts.
 - **`[validation]`** — shell commands run from the repository root (`sh -lc`
   on Unix, `cmd /C` on Windows); every command must exit 0. With no commands
   configured, `doctor` warns that the final gate relies on review only.

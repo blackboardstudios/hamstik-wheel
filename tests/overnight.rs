@@ -171,6 +171,14 @@ esac
 const PI: &str = r#"#!/bin/sh
 case "$*" in *--help*|*--version*) echo test; exit 0;; esac
 prompt=$(cat)
+if [ "$prompt" = 'Reply with the single word: ok.' ]; then
+  if [ "$TEST_MODE" = 'model-404' ]; then
+    echo '{"type":"message_end","message":{"role":"assistant","model":"vendor/model:batch","provider":"openrouter","stopReason":"error","errorMessage":"404: vendor/model:batch cannot be used with the chat/completions endpoint"}}'
+  elif [ "$TEST_MODE" = 'probe-429' ]; then
+    echo '{"type":"message_end","message":{"role":"assistant","model":"resolved-probe","provider":"test-provider","stopReason":"error","errorMessage":"429: upstream rate-limited"}}'
+  fi
+  exit 0
+fi
 if [ -z "$prompt" ]; then exit 0; fi
 model=$2
 printf '%s\n' "$prompt" > ".git/last-$model-prompt"
@@ -202,6 +210,30 @@ else
   fi
 fi
 "#;
+
+#[test]
+fn preflight_fails_when_model_probe_reports_non_retryable_provider_error() {
+    let f = Fixture::new();
+    let output = f.run(&["once"], "model-404");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Implementation model probe failed"));
+    assert!(stderr.contains("404: vendor/model:batch cannot be used"));
+    assert!(!f.root().join(".git/sessions").exists());
+    assert!(!f.root().join(".git/starts").exists());
+}
+
+#[test]
+fn retryable_probe_error_passes_preflight_and_run_proceeds() {
+    let f = Fixture::new();
+    let output = f.run(&["once"], "probe-429");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(f.read(".git/closes"), "TEST-1\n");
+}
 
 #[test]
 fn provider_outage_preserves_review_and_resume_does_not_reimplement() {

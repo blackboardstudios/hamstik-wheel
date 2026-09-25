@@ -16,7 +16,7 @@ use crate::{
     git::GitRepo,
     hamstik::{select_next, HamstikCli, WorkItemSummary},
     logging::Logger,
-    pi::{implementation_prompt, review_prompt, PiRunner, ProviderFailure},
+    pi::{implementation_prompt, provider_failure, review_prompt, PiRunner, ProviderFailure},
     state::{ActiveWorkItem, Phase, SkipRecord, StateStore, WheelState},
     validation::{run_all, ValidationKind},
 };
@@ -203,29 +203,21 @@ impl LoopEngine {
             ));
         }
 
-        if check_pi_model(&self.config.models.implement) {
-            self.logger.info(&format!(
-                "✓ Implementation model available: {}",
-                self.config.models.implement
-            ));
-        } else {
-            self.logger.error(&format!(
-                "✗ Pi could not find implementation model: {}",
-                self.config.models.implement
-            ));
-            failed = true;
-        }
-        if check_pi_model(&self.config.models.review) {
-            self.logger.info(&format!(
-                "✓ Review model available: {}",
-                self.config.models.review
-            ));
-        } else {
-            self.logger.error(&format!(
-                "✗ Pi could not find review model: {}",
-                self.config.models.review
-            ));
-            failed = true;
+        for (label, model) in [
+            ("Implementation", self.config.models.implement.as_str()),
+            ("Review", self.config.models.review.as_str()),
+        ] {
+            match check_pi_model(model) {
+                Ok(()) => self
+                    .logger
+                    .info(&format!("✓ {label} model available: {model}")),
+                Err(reason) => {
+                    self.logger
+                        .error(&format!("✗ Pi probe failed for {label} model: {model}"));
+                    self.logger.error(&format!("  {reason}"));
+                    failed = true;
+                }
+            }
         }
 
         if failed {
@@ -355,19 +347,18 @@ impl LoopEngine {
         self.hamstik
             .verify_required_commands(self.config.hamstik.assign_to_me)?;
         self.hamstik.doctor()?;
-        if !check_pi_model(&self.config.models.implement) {
-            bail!(
-                "Pi could not resolve implementation model `{}`. If it is ambiguous across providers, set the config value to a provider-qualified id like `provider/model` (run `pi --list-models {}` to see matches).",
-                self.config.models.implement,
-                self.config.models.implement
-            );
-        }
-        if !check_pi_model(&self.config.models.review) {
-            bail!(
-                "Pi could not resolve review model `{}`. If it is ambiguous across providers, set the config value to a provider-qualified id like `provider/model` (run `pi --list-models {}` to see matches).",
-                self.config.models.review,
-                self.config.models.review
-            );
+        for (label, model) in [
+            ("Implementation", self.config.models.implement.as_str()),
+            ("Review", self.config.models.review.as_str()),
+        ] {
+            if let Err(reason) = check_pi_model(model) {
+                bail!(
+                    "{label} model probe failed for `{model}`: {reason}. \
+                     If the configured id is a partial pattern, set the full catalog id \
+                     (run `pi --list-models {model}` to see candidates) or a \
+                     `provider/vendor/model` id."
+                );
+            }
         }
         if !pi_supports_json_mode() {
             bail!(
@@ -1231,28 +1222,63 @@ fn check_process(logger: &Logger, name: &str, args: &[&str]) -> bool {
     }
 }
 
-/// Verify Pi can resolve a model id to exactly one provider/model pair, the
-/// way Wheel's agent invocations will. Uses a short real invocation (the
-/// cheapest reliable signal: bare patterns ambiguous across authenticated
-/// providers and unresolvable ids both fail at startup, before any request).
-fn check_pi_model(model: &str) -> bool {
-    use std::io::Write;
-    let Ok(mut child) = Command::new("pi")
+/// Verify Pi can resolve a model id and actually reach its provider, the way
+/// Wheel's agent invocations will. Startup-only resolution cannot catch
+/// fuzzy-pattern mismatches that only surface as request errors (observed:
+/// OpenRouter resolved the partial id `deepseek-v4.1-flash` to the `:batch`
+/// variant, which 404s on chat/completions), so the probe sends a tiny real
+/// prompt. Non-retryable provider errors fail the check; retryable ones
+/// (429, 5xx, connection) pass because the loop's provider handling already
+/// cools down and retries them.
+fn check_pi_model(model: &str) -> Result<(), String> {
+    use std::io::{BufRead, BufReader};
+
+    const PROBE_PROMPT: &str = "Reply with the single word: ok.";
+    let mut child = Command::new("pi")
         .args(["--model", model, "--no-session", "--mode", "json", "-p"])
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-    else {
-        return false;
-    };
-    // An empty prompt resolves instantly at startup; any response is harmless.
-    let _ = child.stdin.as_mut().map(|stdin| stdin.write_all(b""));
-    drop(child.stdin.take());
-    match child.wait() {
-        Ok(status) => status.success(),
-        Err(_) => false,
+        .map_err(|error| format!("failed to start Pi: {error}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(error) = stdin.write_all(PROBE_PROMPT.as_bytes()) {
+            let _ = child.kill();
+            return Err(format!("failed writing probe prompt to Pi stdin: {error}"));
+        }
     }
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to open Pi stdout".to_string())?;
+    let reader = std::thread::Builder::new()
+        .name("pi-probe-stdout".to_string())
+        .spawn(move || {
+            let mut transcript = String::new();
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                transcript.push_str(&line);
+                transcript.push('\n');
+            }
+            transcript
+        })
+        .map_err(|error| format!("failed to spawn Pi probe reader thread: {error}"))?;
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = child.kill();
+            return Err(format!("failed waiting for Pi: {error}"));
+        }
+    };
+    let transcript = reader.join().unwrap_or_default();
+    if !status.success() {
+        return Err(format!("Pi exited {:?}", status.code()));
+    }
+    if let Some(failure) = provider_failure(&transcript, model) {
+        if !failure.retryable {
+            return Err(failure.to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Check that the installed Pi supports the JSON output mode Wheel uses for
