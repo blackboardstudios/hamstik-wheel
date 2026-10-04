@@ -120,6 +120,7 @@ impl HamstikCli {
             "hamstik sprint list",
             "hamstik work list",
             "hamstik work context",
+            "hamstik work view",
             "hamstik work start",
             "hamstik work close",
             "hamstik work transition",
@@ -251,7 +252,9 @@ impl HamstikCli {
     /// transition.
     pub fn item_status(&self, key: &str) -> Result<String> {
         let value = self.run_json(&["work", "view", key])?;
-        Ok(named_value(value.get("status")).unwrap_or_default())
+        named_value(value.get("status"))
+            .filter(|status| !status.trim().is_empty())
+            .context("hamstik work view returned no status; cannot verify claim ownership")
     }
 
     /// Transition an item to an arbitrary allowed target status (e.g. `todo`

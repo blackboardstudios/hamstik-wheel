@@ -278,6 +278,12 @@ impl LoopEngine {
                 .info(&format!("Baseline: {}", item.baseline_sha));
             self.logger
                 .info(&format!("Review cycle: {}", state.review_cycle));
+            if state.phase == Phase::Skipping || item.release_pending {
+                self.logger.warn("Claim: cleanup pending; run `hamstik-wheel resume` to retry status restoration.");
+            } else if item.needs_reclaim {
+                self.logger
+                    .info("Claim: released; local work paused, resume will reclaim the item.");
+            }
         } else {
             self.logger.info("Work Item: none");
         }
@@ -310,10 +316,13 @@ impl LoopEngine {
     }
 
     pub fn run(&self, max_items: Option<usize>) -> Result<()> {
-        self.preflight()?;
         let limit = max_items.unwrap_or(self.config.r#loop.max_items);
         if limit == 0 {
             bail!("max-items must be greater than zero");
+        }
+        let recovered = self.recover_pending_cleanup()?;
+        if recovered.is_none() || limit > 1 {
+            self.preflight_for_work()?;
         }
 
         // Per-run counter: reset at run start so `status` shows this run's
@@ -322,8 +331,11 @@ impl LoopEngine {
         self.store.begin_run(&mut state)?;
 
         let mut completed = 0usize;
-        let mut skipped = 0usize;
+        let mut skipped = usize::from(recovered.is_some());
         let mut excluded = HashSet::new();
+        if let Some(key) = recovered {
+            excluded.insert(key);
+        }
         while completed + skipped < limit {
             match self.process_one(&mut excluded)? {
                 ProcessOutcome::Completed => {
@@ -359,7 +371,10 @@ impl LoopEngine {
     }
 
     pub fn once(&self) -> Result<()> {
-        self.preflight()?;
+        if self.recover_pending_cleanup()?.is_some() {
+            return Ok(());
+        }
+        self.preflight_for_work()?;
         match self.process_one(&mut HashSet::new())? {
             ProcessOutcome::Completed | ProcessOutcome::Skipped => Ok(()),
             ProcessOutcome::NoWork => {
@@ -412,6 +427,117 @@ impl LoopEngine {
         Ok(())
     }
 
+    fn preflight_for_work(&self) -> Result<()> {
+        if let Err(error) = self.preflight() {
+            let mut state = self.store.load()?;
+            if state
+                .current
+                .as_ref()
+                .is_some_and(|item| !item.needs_reclaim)
+            {
+                state.last_error = Some(
+                    crate::security::Redactor::new(self.repo.root()).text(&format!("{error:#}")),
+                );
+                self.pause_active(&mut state)?;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Status cleanup must not depend on a working model provider or sandbox.
+    fn recover_pending_cleanup(&self) -> Result<Option<String>> {
+        let mut state = self.store.load()?;
+        if state.phase == Phase::Skipping {
+            let key = state.current.as_ref().unwrap().key.clone();
+            self.recover_interrupted_skip(&mut state)?;
+            return Ok(Some(key));
+        }
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|item| item.release_pending)
+        {
+            self.pause_active(&mut state)?;
+        }
+        Ok(None)
+    }
+
+    fn pause_active(&self, state: &mut WheelState) -> Result<()> {
+        let Some(active) = state.current.as_mut() else {
+            return Ok(());
+        };
+        active.release_pending = true;
+        self.store.save(state)?;
+        let current = state.current.as_ref().unwrap().clone();
+        let status = self.restore_status(&current)
+            .context("claim release pending; checkpoint retained; run `hamstik-wheel resume` to retry cleanup")?;
+        let active = state.current.as_mut().unwrap();
+        if active.previous_status.is_none() {
+            // A legacy claim already released externally can safely establish
+            // this status as the starting point for a future new claim.
+            active.previous_status = Some(status.clone());
+        }
+        active.release_pending = false;
+        active.needs_reclaim = true;
+        self.store.save(state)?;
+        self.record_progress(
+            Kind::Paused,
+            &current.key,
+            &current.title,
+            &format!("remote status `{status}`; checkpoint retained for resume"),
+        );
+        self.logger.info(&format!(
+            "[pause] {} status is `{status}`; local work retained for resume",
+            current.key
+        ));
+        Ok(())
+    }
+
+    fn restore_status(&self, current: &ActiveWorkItem) -> Result<String> {
+        let status = self.hamstik.item_status(&current.key)?;
+        if !is_in_progress(&status) {
+            // Someone may already have moved it. Never undo their transition.
+            return Ok(status);
+        }
+        let target = current.previous_status.as_deref().context(
+            "legacy checkpoint has no previous status; restore the Work Item to its intended status manually, then resume cleanup",
+        )?;
+        if is_in_progress(target) {
+            bail!(
+                "cannot release {} to an in-progress status; restore its intended status manually",
+                current.key
+            );
+        }
+        self.hamstik
+            .transition(&current.key, target)
+            .with_context(|| format!("could not restore {} to `{target}`", current.key))?;
+        let actual = self.hamstik.item_status(&current.key)?;
+        if actual != target {
+            bail!("status restoration for {} was not confirmed: expected `{target}`, found `{actual}`", current.key);
+        }
+        self.logger
+            .info(&format!("[cleanup] {} restored to `{target}`", current.key));
+        Ok(actual)
+    }
+
+    fn claim_status(&self, current: &ActiveWorkItem) -> Result<()> {
+        let status = self.hamstik.item_status(&current.key)?;
+        if is_in_progress(&status) {
+            // A prior claim request may have succeeded before a crash or a
+            // lost response. The pre-claim status remains durable.
+            return Ok(());
+        }
+        if current.previous_status.as_deref() != Some(status.as_str()) {
+            bail!("{} status changed to `{status}` since the checkpoint; refusing to reclaim automatically", current.key);
+        }
+        self.hamstik.start(&current.key)?;
+        if !is_in_progress(&self.hamstik.item_status(&current.key)?) {
+            bail!("claim of {} did not confirm in_progress", current.key);
+        }
+        Ok(())
+    }
+
     fn process_one(&self, excluded: &mut HashSet<String>) -> Result<ProcessOutcome> {
         let mut state = self.store.load()?;
 
@@ -422,7 +548,7 @@ impl LoopEngine {
             let key = state.current.as_ref().unwrap().key.clone();
             self.recover_interrupted_skip(&mut state)?;
             excluded.insert(key);
-            state = self.store.load()?;
+            return Ok(ProcessOutcome::Skipped);
         }
 
         if state.current.is_none() {
@@ -441,6 +567,9 @@ impl LoopEngine {
                 baseline_sha: baseline,
                 commit_sha: None,
                 validation_command_count: 0,
+                previous_status: None,
+                release_pending: false,
+                needs_reclaim: false,
             });
             state.phase = Phase::Selected;
             state.review_cycle = 0;
@@ -462,6 +591,7 @@ impl LoopEngine {
             if error.downcast_ref::<ProviderFailure>().is_some()
                 || error_text.contains("Wheel tool guard did not initialize")
             {
+                self.pause_active(&mut state)?;
                 return Err(error.context("provider unavailable; active checkpoint preserved; run `hamstik-wheel resume` after restoring provider access"));
             }
 
@@ -481,7 +611,8 @@ impl LoopEngine {
                 state.phase = Phase::Skipping;
                 self.store.save(&mut state)?;
 
-                if let Err(cleanup_error) = self.complete_skip_cleanup(&key, &baseline) {
+                let active = state.current.as_ref().unwrap().clone();
+                if let Err(cleanup_error) = self.complete_skip_cleanup(&active) {
                     // Recovery is designed to make this reachable only on a
                     // hard Git failure; surface both errors and stop.
                     state.last_error = Some(format!(
@@ -506,11 +637,12 @@ impl LoopEngine {
                 self.store.finish_skip(&mut state, record)?;
                 self.record_progress(Kind::Skipped, &key, &title, &classify_failure(&error_text));
                 self.logger.info(&format!(
-                    "[skip] {key} recorded; item returned to the eligible pool; continuing"
+                    "[skip] {key} recorded; status claim released; continuing"
                 ));
                 excluded.insert(key);
                 return Ok(ProcessOutcome::Skipped);
             }
+            self.pause_active(&mut state)?;
             return Err(error);
         }
 
@@ -642,7 +774,7 @@ impl LoopEngine {
             "[recover] {key}: interrupted skip cleanup detected; completing it"
         ));
 
-        if let Err(cleanup_error) = self.complete_skip_cleanup(&key, &baseline) {
+        if let Err(cleanup_error) = self.complete_skip_cleanup(active) {
             // Keep the Skipping phase so a later invocation can retry the
             // recovery; do not clear active state on a hard cleanup failure.
             state.last_error = Some(format!("skip cleanup recovery failed: {cleanup_error:#}"));
@@ -677,7 +809,7 @@ impl LoopEngine {
             "interrupted skip cleanup recovered",
         );
         self.logger.info(&format!(
-            "[recover] {key}: skip completed; item returned to the eligible pool"
+            "[recover] {key}: skip completed; status claim released"
         ));
         Ok(())
     }
@@ -686,7 +818,9 @@ impl LoopEngine {
     /// on a WIP branch, restore the baseline, and return the Work Item to the
     /// eligible pool. Runs after the `Skipping` phase is persisted, so a crash
     /// anywhere inside is completed by recover_interrupted_skip.
-    fn complete_skip_cleanup(&self, key: &str, baseline: &str) -> Result<()> {
+    fn complete_skip_cleanup(&self, current: &ActiveWorkItem) -> Result<()> {
+        let key = &current.key;
+        let baseline = &current.baseline_sha;
         let wip_branch = self
             .repo
             .preserve_wip(key, baseline)
@@ -699,36 +833,39 @@ impl LoopEngine {
         self.repo
             .checkout_baseline(baseline)
             .context("baseline restore failed")?;
-        // Return the item to the eligible pool only if a transition is needed
-        // (a claim that failed before `work start` left the item untouched).
-        // Idempotent under recovery: re-running is a no-op once the item is
-        // back in a candidate status.
-        match self.hamstik.item_status(key) {
-            Ok(status) => {
-                let normalized = status.trim().to_ascii_lowercase().replace(['-', ' '], "_");
-                if normalized == "in_progress" || normalized == "inprogress" {
-                    if let Err(transition_error) = self.hamstik.transition(key, "todo") {
-                        // Non-fatal: the item stays in the pool only after a
-                        // manual move, but the skip itself is already durable.
-                        self.logger.warn(&format!(
-                            "[skip] could not return {key} to todo ({transition_error:#}); move it back manually"
-                        ));
-                    } else {
-                        self.logger
-                            .info(&format!("[cleanup] {key} returned to `todo`"));
-                    }
-                }
-            }
-            Err(status_error) => {
-                self.logger.warn(&format!(
-                    "[skip] could not read {key} status before return-to-pool ({status_error:#})"
-                ));
-            }
-        }
+        self.restore_status(current)?;
         Ok(())
     }
 
     fn process_active(&self, state: &mut WheelState) -> Result<()> {
+        // Persist the actual pre-claim status before a possibly ambiguous API
+        // response. Never replace it with in_progress after a crash/retry.
+        if state.phase == Phase::Selected
+            && state
+                .current
+                .as_ref()
+                .is_some_and(|item| item.previous_status.is_none())
+        {
+            let active = state.current.as_mut().unwrap();
+            let status = self.hamstik.item_status(&active.key)?;
+            if is_in_progress(&status) {
+                bail!("{} is already in progress; refusing to claim work without a known return status", active.key);
+            }
+            active.previous_status = Some(status);
+            self.store.save(state)?;
+        }
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|item| item.needs_reclaim)
+        {
+            let current = state.current.as_ref().unwrap().clone();
+            self.claim_status(&current)?;
+            let active = state.current.as_mut().unwrap();
+            active.needs_reclaim = false;
+            state.last_error = None;
+            self.store.save(state)?;
+        }
         let current = state
             .current
             .clone()
@@ -750,7 +887,7 @@ impl LoopEngine {
                 );
             }
             self.logger.info(&format!("[claim] {}", current.key));
-            self.hamstik.start(&current.key)?;
+            self.claim_status(&current)?;
             self.record_progress(
                 Kind::Started,
                 &current.key,
@@ -1319,7 +1456,7 @@ impl LoopEngine {
     ) -> Result<()> {
         self.logger.warn(&format!("[skip] {key}: {error}"));
         let body = format!(
-            "Hamstik Wheel could not complete automated work for this Work Item and moved on (on_failure = skip).\n\n- Failure: {error}\n- Baseline: `{baseline}`\n- The item was returned to `todo` and stays eligible for later runs"
+            "Hamstik Wheel could not complete automated work for this Work Item and moved on (on_failure = skip).\n\n- Failure: {error}\n- Baseline: `{baseline}`\n- The status claim was released: the pre-claim status was restored, or an already-changed status was left untouched."
         );
         let idem = comment_idempotency_key("skip", key, baseline);
         if let Err(comment_error) = self.hamstik.add_comment(key, &body, Some(&idem)) {
@@ -1336,6 +1473,17 @@ enum ProcessOutcome {
     Completed,
     Skipped,
     NoWork,
+}
+
+fn is_in_progress(status: &str) -> bool {
+    matches!(
+        status
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_")
+            .as_str(),
+        "in_progress" | "inprogress"
+    )
 }
 
 fn require_process(name: &str, args: &[&str]) -> Result<()> {

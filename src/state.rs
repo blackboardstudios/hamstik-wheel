@@ -38,6 +38,15 @@ pub struct ActiveWorkItem {
     pub commit_sha: Option<String>,
     #[serde(default)]
     pub validation_command_count: usize,
+    /// Saved before the first claim. None on checkpoints from older versions.
+    #[serde(default)]
+    pub previous_status: Option<String>,
+    /// Durable intent: retry releasing the remote claim before doing more work.
+    #[serde(default)]
+    pub release_pending: bool,
+    /// Work is retained locally, but the remote claim has been released.
+    #[serde(default)]
+    pub needs_reclaim: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +218,9 @@ mod tests {
             baseline_sha: "abc".to_string(),
             commit_sha: None,
             validation_command_count: 0,
+            previous_status: None,
+            release_pending: false,
+            needs_reclaim: false,
         })
     }
 

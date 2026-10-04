@@ -35,7 +35,7 @@ impl Fixture {
             )
             .unwrap();
         }
-        let commands: Vec<_> = ["doctor", "commands", "sprint list", "work list", "work context", "work start", "work close", "work transition", "work comment add", "work edit"]
+        let commands: Vec<_> = ["doctor", "commands", "sprint list", "work list", "work context", "work view", "work start", "work close", "work transition", "work comment add", "work edit"]
             .iter().map(|command| json!({"command": format!("hamstik {command}"), "capabilities":{"json":true,"noInput":true}})).collect();
         fixture.write(
             ".git/manifest.json",
@@ -161,11 +161,21 @@ case "$1 $2" in
     done
     cat .git/candidates.json;;
   'work context') if [ -f ".git/context-$3.json" ]; then cat ".git/context-$3.json"; else printf '{"item":{"key":"%s"},"links":{"items":[],"page":{"hasMore":false}}}\n' "$3"; fi;;
-  'work start') echo "$3" >> .git/starts; echo '{}';;
-  'work view') echo '{"status":"in_progress"}';;
+  'work start') echo "$3" >> .git/starts; echo in_progress > ".git/status-$3"; echo '{}';;
+  'work view')
+    if [ -f .git/view-fails ] && [ -f .git/starts ]; then echo 'status unavailable' >&2; exit 8; fi
+    if [ -f .git/view-malformed ] && [ -f .git/starts ]; then echo '{}'; exit 0; fi
+    if [ -f ".git/status-$3" ]; then status=$(cat ".git/status-$3"); else status=todo; fi
+    printf '{"status":"%s"}\n' "$status";;
+  'work transition')
+    echo "$3 $4" >> .git/transitions
+    if [ -f .git/transition-fails ]; then echo 'transition unavailable' >&2; exit 8; fi
+    if [ ! -f .git/transition-noop ]; then echo "$4" > ".git/status-$3"; fi
+    echo '{}';;
   'work close')
     if [ "$TEST_MODE" = 'close-fails' ]; then echo 'close unavailable' >&2; exit 1; fi
     echo "$3" >> .git/closes
+    echo done > ".git/status-$3"
     if [ -f .git/drain-sprint ]; then echo '{"items":[]}' > ".git/sprint-$(cat .git/drain-sprint).json"; fi
     echo '{}';;
   'work comment') cat > /dev/null; echo '{}';;
@@ -201,6 +211,7 @@ echo "$model" >> .git/sessions
 if [ "$model" = 'implement' ]; then
   case "$prompt" in *'Work Item: TEST-1 '*) key=TEST-1;; *) key=TEST-2;; esac
   echo changed > "$key.txt"
+  if [ -f .git/status-during-implementation ]; then cat .git/status-during-implementation > ".git/status-$key"; fi
   if [ "$TEST_MODE" = 'skip' ] && [ "$key" = 'TEST-1' ]; then
     echo '{"type":"wheel_result","result":{"findings":["blocked"],"unverified_checks":[],"status":"blocked","summary":"item blocked"}}'
   elif [ "$TEST_MODE" = 'unverified' ]; then
@@ -261,6 +272,9 @@ fn provider_outage_preserves_review_and_resume_does_not_reimplement() {
         .contains("provider unavailable; active checkpoint preserved"));
     let state = f.state();
     assert_eq!(state["phase"], "reviewing");
+    assert_eq!(state["current"]["previousStatus"], "todo");
+    assert_eq!(state["current"]["needsReclaim"], true);
+    assert_eq!(f.read(".git/status-TEST-1").trim(), "todo");
     assert_eq!(state["current"]["key"], "TEST-1");
     assert!(state["lastError"]
         .as_str()
@@ -282,6 +296,7 @@ fn provider_outage_preserves_review_and_resume_does_not_reimplement() {
     assert_eq!(f.read(".git/sessions").matches("implement").count(), 1);
     assert_eq!(f.read(".git/closes"), "TEST-1\n");
     assert_eq!(f.state()["phase"], "idle");
+    assert_eq!(f.read(".git/starts"), "TEST-1\nTEST-1\n");
     assert_eq!(f.transcripts("TEST-1", "review-01.log").len(), 4);
 }
 
@@ -595,8 +610,119 @@ fn resumed_item_is_not_replaced_when_sprint_changes() {
     // Resume must not need sprint discovery at all.
     f.write(".git/sprint-error", "fail");
     assert!(f.run(&["resume"], "success").status.success());
-    assert_eq!(f.read(".git/starts"), "TEST-1\n");
+    assert_eq!(f.read(".git/starts"), "TEST-1\nTEST-1\n");
     assert_eq!(f.read(".git/closes"), "TEST-1\n");
+}
+
+#[test]
+fn skip_restores_actual_preclaim_status_instead_of_assuming_todo() {
+    let f = Fixture::new();
+    // The candidate list is stale; the server status at claim time wins.
+    f.write(".git/status-TEST-1", "backlog\n");
+    assert!(f.run(&["once"], "skip").status.success());
+    assert_eq!(f.read(".git/transitions"), "TEST-1 backlog\n");
+    assert_eq!(f.read(".git/status-TEST-1").trim(), "backlog");
+    assert_eq!(f.state()["phase"], "idle");
+}
+
+#[test]
+fn failed_skip_restoration_retains_checkpoint_and_recovers_without_models() {
+    for failure in [
+        "transition-fails",
+        "transition-noop",
+        "view-fails",
+        "view-malformed",
+    ] {
+        let f = Fixture::new();
+        f.write(&format!(".git/{failure}"), "fail");
+        let output = f.run(&["run", "--max-items", "2"], "skip");
+        assert!(!output.status.success(), "{failure}");
+        let state = f.state();
+        assert_eq!(state["phase"], "skipping", "{failure}");
+        assert_eq!(state["current"]["key"], "TEST-1");
+        assert_eq!(state["current"]["previousStatus"], "todo");
+        assert_eq!(state["skipLedger"].as_array().unwrap().len(), 0);
+        assert_eq!(f.read(".git/starts"), "TEST-1\n");
+        fs::remove_file(f.root().join(format!(".git/{failure}"))).unwrap();
+        // This mode fails preflight if called. Recovery must finish without it.
+        let output = f.run(&["resume"], "model-404");
+        assert!(
+            output.status.success(),
+            "{failure}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(f.state()["phase"], "idle");
+        assert_eq!(f.read(".git/status-TEST-1").trim(), "todo");
+        assert_eq!(f.read(".git/starts"), "TEST-1\n");
+        assert!(!f.root().join(".git/closes").exists());
+    }
+}
+
+#[test]
+fn halt_releases_claim_without_discarding_resumable_work() {
+    let f = Fixture::new();
+    f.write(
+        ".hamstik-wheel.toml",
+        &f.read(".hamstik-wheel.toml")
+            .replace("on_failure = \"skip\"", "on_failure = \"halt\""),
+    );
+    f.git(&["add", "-A"]);
+    f.git(&["commit", "-qm", "halt mode"]);
+    f.write(".git/status-TEST-1", "backlog\n");
+    assert!(!f.run(&["once"], "skip").status.success());
+    assert_eq!(f.read(".git/status-TEST-1").trim(), "backlog");
+    assert_eq!(f.state()["phase"], "implementing");
+    assert_eq!(f.state()["current"]["needsReclaim"], true);
+    assert!(f.root().join("TEST-1.txt").exists());
+    let report = f.run(&["--no-timestamps", "progress-report"], "success");
+    assert!(String::from_utf8_lossy(&report.stdout).contains("Paused TEST-1"));
+    assert!(f.run(&["resume"], "success").status.success());
+    assert_eq!(f.read(".git/starts"), "TEST-1\nTEST-1\n");
+    assert_eq!(f.read(".git/status-TEST-1").trim(), "done");
+}
+
+#[test]
+fn provider_failure_keeps_release_intent_until_verified_before_another_probe() {
+    let f = Fixture::new();
+    f.write(".git/transition-fails", "fail");
+    assert!(!f.run(&["once"], "rate-limit").status.success());
+    assert_eq!(f.state()["current"]["releasePending"], true);
+    assert_eq!(f.read(".git/status-TEST-1").trim(), "in_progress");
+    fs::remove_file(f.root().join(".git/transition-fails")).unwrap();
+    let output = f.run(&["resume"], "model-404");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("model probe failed"));
+    assert_eq!(f.read(".git/status-TEST-1").trim(), "todo");
+    assert_eq!(f.state()["current"]["releasePending"], false);
+    assert_eq!(f.state()["current"]["needsReclaim"], true);
+    assert_eq!(f.read(".git/starts"), "TEST-1\n");
+}
+
+#[test]
+fn legacy_checkpoint_does_not_guess_previous_status_and_preserves_manual_transitions() {
+    let f = Fixture::new();
+    f.write(".git/transition-fails", "fail");
+    assert!(!f.run(&["once"], "skip").status.success());
+    fs::remove_file(f.root().join(".git/transition-fails")).unwrap();
+    let mut state = f.state();
+    state["current"]
+        .as_object_mut()
+        .unwrap()
+        .remove("previousStatus");
+    f.set_state(&state);
+    f.write(".git/transitions", "");
+    let output = f.run(&["resume"], "success");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("legacy checkpoint has no previous status"));
+    assert_eq!(f.state()["phase"], "skipping");
+    assert_eq!(f.read(".git/transitions"), "");
+    // User resolves the unknown historical status; Wheel must not overwrite it.
+    f.write(".git/status-TEST-1", "backlog\n");
+    assert!(f.run(&["resume"], "model-404").status.success());
+    assert_eq!(f.state()["phase"], "idle");
+    assert_eq!(f.read(".git/status-TEST-1").trim(), "backlog");
+    assert_eq!(f.read(".git/transitions"), "");
 }
 
 #[test]

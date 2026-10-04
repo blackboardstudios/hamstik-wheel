@@ -31,6 +31,8 @@ pub enum Kind {
     Closing,
     Completed,
     Failed,
+    Paused,
+    ReleasePending,
     Skipping,
     Skipped,
     Deferred,
@@ -48,6 +50,8 @@ impl Kind {
             Self::Closing => "Closing",
             Self::Completed => "Completed",
             Self::Failed => "Failed",
+            Self::Paused => "Paused",
+            Self::ReleasePending => "Release pending",
             Self::Skipping => "Skipping",
             Self::Skipped => "Skipped",
             Self::Deferred => "Deferred",
@@ -238,7 +242,13 @@ impl Report {
             };
             report.observe(Event {
                 timestamp: state.updated_at,
-                kind: if state.last_error.is_some() {
+                kind: if state.phase == Phase::Skipping {
+                    Kind::Skipping
+                } else if current.release_pending {
+                    Kind::ReleasePending
+                } else if current.needs_reclaim {
+                    Kind::Paused
+                } else if state.last_error.is_some() {
                     Kind::Failed
                 } else {
                     kind
