@@ -20,6 +20,14 @@ pub struct Config {
     pub r#loop: LoopConfig,
     pub git: GitConfig,
     pub comments: CommentsConfig,
+    pub sandbox: SandboxConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SandboxConfig {
+    /// Additional toolchain directories mounted read-only in tool sandboxes.
+    pub read_only_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,8 +77,20 @@ impl Default for ModelsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ValidationConfig {
+    pub execution: ValidationExecution,
     pub commands: Vec<String>,
     pub rules: Vec<ValidationRule>,
+    /// Paths that must be covered by a specialized validation rule.
+    pub require_rules_for: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationExecution {
+    #[default]
+    Sandbox,
+    /// Explicit operator trust: commands execute agent-modified code on the host.
+    TrustedHost,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +101,24 @@ pub struct ValidationRule {
 }
 
 impl ValidationConfig {
+    pub fn require_coverage(&self, paths: &[String]) -> Result<()> {
+        for path in paths {
+            if self
+                .require_rules_for
+                .iter()
+                .any(|prefix| path.starts_with(prefix))
+                && !self.rules.iter().any(|rule| {
+                    rule.path_prefixes
+                        .iter()
+                        .any(|prefix| path.starts_with(prefix))
+                })
+            {
+                bail!("required validation rule missing for changed path {path}");
+            }
+        }
+        Ok(())
+    }
+
     pub fn commands_for_paths(&self, paths: &[String]) -> Vec<String> {
         let mut commands = self.commands.clone();
         for rule in &self.rules {
@@ -244,6 +282,21 @@ impl Config {
                 {
                     bail!("validation path prefix `{prefix}` must be a repository-relative literal prefix");
                 }
+            }
+        }
+        for prefix in &self.validation.require_rules_for {
+            if prefix.trim().is_empty()
+                || prefix.starts_with('/')
+                || prefix.contains("..")
+                || prefix.starts_with("./")
+                || prefix.contains(['*', '?', '\\', ':'])
+            {
+                bail!("validation require_rules_for entries must be repository-relative literal prefixes");
+            }
+        }
+        for path in &self.sandbox.read_only_paths {
+            if !Path::new(path).is_absolute() {
+                bail!("sandbox read_only_paths must be absolute directories");
             }
         }
         if self

@@ -23,11 +23,24 @@ label_names = []
 implement = "step-3.7-flash"
 review = "glm-5.3-flash"
 
+# Optional additional toolchain directories. Linux Bubblewrap isolation is always on.
+# The directory and its bin/ subdirectory are added to the isolated tool PATH.
+[sandbox]
+read_only_paths = []
+
 [validation]
-# Commands run from the repository root. All must pass before completion.
+# Sandboxed by default, including agent-edited scripts. At least one base command
+# is required. Every command must pass. No host network, sockets or credentials.
+execution = "sandbox"
+# Opting into execution = "trusted_host" gives edited tests/scripts full host
+# access. Use ONLY inside an already disposable trusted VM/container, with
+# disposable test resources. Never enable this just to bypass isolation failures.
 commands = [
   "./scripts/do-prechecks.py",
 ]
+
+# Require specialized rule coverage for critical paths (adapt to your repository).
+# require_rules_for = ["drizzle/", "src/db/"]
 
 # Optional specialized gates. Literal repository-relative prefixes, not globs.
 # Every matched command must pass; rules are re-evaluated after review edits.
@@ -46,7 +59,7 @@ on_failure = "halt"
 # Wall-clock cap for each agent session, in minutes. 0 disables the cap.
 agent_timeout_minutes = 105
 # Retry the implementation session once when the first attempt fails to
-# produce a parsable result marker.
+# submit a valid wheel_result tool result.
 implement_retry = false
 # Additional sessions for transient provider errors (0 disables; maximum 10).
 # Authentication failures stop immediately. Independent of implement_retry.

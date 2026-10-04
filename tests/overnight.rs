@@ -1,7 +1,7 @@
 // Copyright 2026 Blackboard Studios LLC
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use serde_json::{json, Value};
 use std::{
@@ -59,6 +59,7 @@ cli_path = ".git/bin/hamstik"
 implement = "implement"
 review = "review"
 [validation]
+execution = "trusted_host"
 commands = ["true"]
 [loop]
 on_failure = "skip"
@@ -97,19 +98,22 @@ post_completed = false
         );
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
-    fn run(&self, args: &[&str], mode: &str) -> Output {
+    fn command(&self, args: &[&str], mode: &str) -> Command {
         let path = format!(
             "{}:{}",
             self.root().join(".git/bin").display(),
             std::env::var("PATH").unwrap()
         );
-        Command::new(env!("CARGO_BIN_EXE_hamstik-wheel"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hamstik-wheel"));
+        command
             .current_dir(self.root())
             .env("PATH", path)
             .env("TEST_MODE", mode)
-            .args(args)
-            .output()
-            .unwrap()
+            .args(args);
+        command
+    }
+    fn run(&self, args: &[&str], mode: &str) -> Output {
+        self.command(args, mode).output().unwrap()
     }
     fn state(&self) -> Value {
         serde_json::from_str(&self.read(".git/hamstik-wheel/state.json")).unwrap()
@@ -156,7 +160,7 @@ case "$1 $2" in
       shift
     done
     cat .git/candidates.json;;
-  'work context') printf '{"item":{"key":"%s"}}\n' "$3";;
+  'work context') if [ -f ".git/context-$3.json" ]; then cat ".git/context-$3.json"; else printf '{"item":{"key":"%s"},"links":{"items":[],"page":{"hasMore":false}}}\n' "$3"; fi;;
   'work start') echo "$3" >> .git/starts; echo '{}';;
   'work view') echo '{"status":"in_progress"}';;
   'work close')
@@ -169,6 +173,7 @@ esac
 "#;
 
 const PI: &str = r#"#!/bin/sh
+case " $* " in *' --wheel-guard-check '*) echo '{"type":"wheel_guard_ready","version":1}'; exit 0;; esac
 case "$*" in *--help*|*--version*) echo test; exit 0;; esac
 prompt=$(cat)
 if [ "$prompt" = 'Reply with the single word: ok.' ]; then
@@ -181,17 +186,26 @@ if [ "$prompt" = 'Reply with the single word: ok.' ]; then
 fi
 if [ -z "$prompt" ]; then exit 0; fi
 model=$2
+if [ "$TEST_MODE" = 'missing-guard' ]; then
+  echo '{"type":"wheel_result","result":{"status":"pass","summary":"unsafe","findings":[],"unverified_checks":[]}}'; exit 0
+fi
+if [ "$TEST_MODE" = 'slow-log' ]; then
+  echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"postgresql://someone:password@localhost/test"}]}}'
+  echo $$ > .git/slow-pid
+  sleep 30
+fi
+echo '{"type":"wheel_guard_ready","version":1}'
 printf '%s\n' "$prompt" > ".git/last-$model-prompt"
 echo "$model" >> .git/sessions
 if [ "$model" = 'implement' ]; then
   case "$prompt" in *'Work Item: TEST-1 '*) key=TEST-1;; *) key=TEST-2;; esac
   echo changed > "$key.txt"
   if [ "$TEST_MODE" = 'skip' ] && [ "$key" = 'TEST-1' ]; then
-    echo 'HAMSTIK_WHEEL_RESULT={"status":"blocked","summary":"item blocked","findings":["blocked"]}'
+    echo '{"type":"wheel_result","result":{"findings":["blocked"],"unverified_checks":[],"status":"blocked","summary":"item blocked"}}'
   elif [ "$TEST_MODE" = 'unverified' ]; then
-    echo 'HAMSTIK_WHEEL_RESULT={"status":"ready_for_review","summary":"implemented","unverified_checks":["populated migration test"]}'
+    echo '{"type":"wheel_result","result":{"findings":[],"unverified_checks":["populated migration test"],"status":"ready_for_review","summary":"implemented"}}'
   else
-    echo 'HAMSTIK_WHEEL_RESULT={"status":"ready_for_review","summary":"implemented","findings":[]}'
+    echo '{"type":"wheel_result","result":{"findings":[],"unverified_checks":[],"status":"ready_for_review","summary":"implemented"}}'
   fi
 else
   if [ "$TEST_MODE" = 'review-migration' ]; then echo migration > migration.sql; fi
@@ -204,9 +218,9 @@ else
   elif [ "$TEST_MODE" = 'no-marker' ]; then
     echo 'No marker'
   elif [ "$TEST_MODE" = 'unverified-review' ]; then
-    echo 'HAMSTIK_WHEEL_RESULT={"status":"pass","summary":"reviewed","unverified_checks":["populated migration test"]}'
+    echo '{"type":"wheel_result","result":{"findings":[],"unverified_checks":["populated migration test"],"status":"pass","summary":"reviewed"}}'
   else
-    echo 'HAMSTIK_WHEEL_RESULT={"status":"pass","summary":"reviewed","findings":[]}'
+    echo '{"type":"wheel_result","result":{"findings":[],"unverified_checks":[],"status":"pass","summary":"reviewed"}}'
   fi
 fi
 "#;
@@ -586,4 +600,125 @@ fn multiple_active_sprints_share_the_existing_candidate_order() {
         .collect();
     assert_eq!(lists.len(), 2);
     assert!(lists.iter().all(|line| line.contains("--sprint")));
+}
+
+#[test]
+fn unfinished_dependency_is_deferred_before_claim_and_does_not_hide_ready_work() {
+    let f = Fixture::new();
+    f.write(
+        ".git/context-TEST-1.json",
+        &json!({"item":{"key":"TEST-1"},"links":{"items":[
+        {"relation":"blocked_by","otherWorkItem":{"key":"TEST-2","status":"todo"}}
+    ],"page":{"hasMore":false}}})
+        .to_string(),
+    );
+    let output = f.run(&["once"], "pass");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(f.read(".git/starts").trim(), "TEST-2");
+    assert_eq!(f.read(".git/closes").trim(), "TEST-2");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("unfinished prerequisites"));
+}
+
+#[test]
+fn incomplete_dependency_evidence_stops_before_claim() {
+    let f = Fixture::new();
+    f.write(
+        ".git/context-TEST-1.json",
+        &json!({"links":{"items":[],"page":{"hasMore":true}}}).to_string(),
+    );
+    assert!(!f.run(&["once"], "pass").status.success());
+    assert!(!f.root().join(".git/starts").exists());
+}
+
+#[test]
+fn missing_tool_guard_never_closes_or_skips_the_item() {
+    let f = Fixture::new();
+    assert!(!f.run(&["once"], "missing-guard").status.success());
+    assert!(!f.root().join(".git/closes").exists());
+    assert_eq!(f.state()["current"]["key"], "TEST-1");
+    assert_eq!(f.state()["skipLedger"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn required_rule_coverage_blocks_completion_when_no_rule_covers_a_change() {
+    let f = Fixture::new();
+    let config = f.read(".hamstik-wheel.toml").replace(
+        "commands = [\"true\"]",
+        "commands = [\"true\"]\nrequire_rules_for = [\"TEST-\"]",
+    );
+    f.write(".hamstik-wheel.toml", &config);
+    f.git(&["add", ".hamstik-wheel.toml"]);
+    f.git(&["commit", "-qm", "validation policy"]);
+    assert!(f.run(&["once"], "pass").status.success());
+    assert!(!f.root().join(".git/closes").exists());
+    assert_eq!(f.state()["skipLedger"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn live_transcripts_are_redacted_and_survive_wheel_termination() {
+    use std::{
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    let f = Fixture::new();
+    let mut child = f
+        .command(&["once"], "slow-log")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !f.root().join(".git/slow-pid").exists() && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let logs = f.transcripts("TEST-1", "implement.log");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(logs.len(), 1);
+    assert!(logs[0].contains("[REDACTED]@localhost/test"));
+    assert!(!logs[0].contains("someone:password"));
+    assert!(!f.transcripts("TEST-1", "implement.log")[0].is_empty());
+}
+
+#[test]
+fn validation_defaults_to_isolation_even_for_agent_editable_scripts() {
+    let f = Fixture::new();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel");
+    fs::write(&sentinel, "original").unwrap();
+    let config = f
+        .read(".hamstik-wheel.toml")
+        .replace("execution = \"trusted_host\"\n", "")
+        .replace("commands = [\"true\"]", "commands = [\"sh validate.sh\"]");
+    f.write(".hamstik-wheel.toml", &config);
+    f.write(
+        "validate.sh",
+        &format!(
+            "set -e\ntest -z \"${{WHEEL_TEST_SECRET:-}}\"\nmkdir -p '{}'\nprintf changed > '{}'\n",
+            outside.path().display(),
+            sentinel.display()
+        ),
+    );
+    f.git(&["add", "-A"]);
+    f.git(&["commit", "-qm", "isolated validation"]);
+    let result = f
+        .command(&["once"], "pass")
+        .env("WHEEL_TEST_SECRET", "host-secret")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        f.root().join(".git/closes").exists(),
+        "{}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "original");
 }

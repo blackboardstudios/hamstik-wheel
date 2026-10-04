@@ -28,6 +28,7 @@ next eligible item.
 
 ### Requirements
 
+- Linux with unprivileged user namespaces, `/usr/bin/bwrap` (Bubblewrap), and Node.js 22+ at `/usr/bin/node`
 - Git
 - The [Pi coding agent](https://github.com/earendil-works/pi) (`pi` on `PATH`)
 - [Hamstik CLI](https://github.com/blackboardstudios/hamstik-cli) (`hamstik` on
@@ -221,12 +222,12 @@ hamstik-wheel --no-timestamps status
   selected timestamps applied) to the given file. The file is opened in append
   mode and created (including parent directories) if missing, so repeated runs
   accumulate one continuous history.
-- `--verbose` — stream validation subprocess output verbatim. By default Wheel
+- `--verbose` — show redacted validation subprocess output. By default Wheel
   shows concise inspection/remediation progress and keeps the full output in
   the per-Work-Item validation log.
 
 Timestamps apply only to lines Wheel generates itself. With `--verbose`,
-validation subprocess output is streamed verbatim and mirrored into
+validation subprocess output is redacted and mirrored into
 `--log-file` when enabled. With or without `--verbose`, the complete output is
 captured in per-Work-Item logs under Git metadata.
 
@@ -251,10 +252,11 @@ in-place console line showing what the agent is doing and for how long:
 - Wheel launches Pi with `--mode json` to receive these events; `doctor` and
   `preflight` verify the installed Pi supports JSON output mode and fail with
   a clear error otherwise.
-- The full event stream is captured verbatim in the per-Work-Item transcript
-  logs under Git metadata (`hamstik-wheel/logs/<KEY>/…`), and the structured
-  `HAMSTIK_WHEEL_RESULT` marker is extracted from the session's final
-  assistant message.
+- Complete events are redacted and appended to an attempt log under Git metadata
+  (`hamstik-wheel/logs/<KEY>/history/…`) as they arrive, including stderr.
+  Partial message/tool deltas are omitted because credentials can span chunks.
+  The agent submits its verdict through the typed `wheel_result` tool. A prose
+  summary or a printed result marker alone cannot complete a guarded session.
 
 ## Configuration
 
@@ -320,9 +322,10 @@ post_completed = true
   variant like `:batch` that fails every request. Doctor and preflight probe
   both models with a tiny real request and stop the run on non-retryable
   provider errors (wrong model, authentication) before any Work Item starts.
-- **`[validation]`** — shell commands run from the repository root (`sh -lc`
-  on Unix, `cmd /C` on Windows); every command must exit 0. With no commands
-  configured, `doctor` warns that the final gate relies on review only.
+- **`[validation]`** — shell commands run from the repository root using isolated
+  `bash --noprofile --norc -c` by default; explicit `trusted_host` uses `sh -lc`.
+  Every command must exit 0. With no commands
+  configured, `doctor` and run preflight fail. At least one base command is required.
   Optional `[[validation.rules]]` add commands when changed paths match any
   configured literal repository-relative prefix; rules are evaluated before
   inspection and again before final validation, including new and deleted files.
@@ -332,8 +335,7 @@ post_completed = true
   item's baseline tree, and continue with the next item instead of stopping
   (`"halt"` stops the run — the default); `agent_timeout_minutes` caps each
   agent session's wall-clock time (0 disables); `implement_retry` retries the
-  implementation session once when it fails to produce a parsable result
-  marker. Provider errors use `provider_retries` (default 3 additional
+  implementation session once when it fails to submit a valid structured result. Provider errors use `provider_retries` (default 3 additional
   sessions, maximum 10) and `provider_retry_delay_seconds` (default 30).
   The delay doubles between retries, capped at 300 seconds. Set retries to
   0 to stop immediately on a provider failure.
@@ -363,11 +365,106 @@ Changes made during review activate rules too.
 
 Agents receive the validation configuration and must identify required
 checks that it omits. The result protocol includes `unverified_checks`;
-nonempty entries block completion even if the marker says `ready_for_review`
+nonempty entries block completion even if the result says `ready_for_review`
 or `pass`. An unavailable required check must be reported as blocked unless
 it is explicitly scheduled in Wheel's validation configuration. Wheel does
 not infer required checks by parsing repository prose or agent summaries;
 configure critical checks as commands/rules for a deterministic gate.
+
+## Agent isolation and host validation
+
+Agent execution now requires Linux, Bubblewrap at `/usr/bin/bwrap`, and Node.js
+at `/usr/bin/node`. There is no automatic unconfined fallback. Windows/macOS can
+build the CLI and inspect configuration/state, but execution stops before claiming
+work until a supported sandbox is available. Install the OS packages and run
+`hamstik-wheel doctor`; it checks an actual sandbox and loads the Pi extension
+without making a model request for that extension check.
+
+Wheel disables Pi's built-in tools and extension discovery and enables only its
+embedded `wheel_read`, `wheel_write`, `wheel_edit`, `wheel_bash`, and
+`wheel_result` tools. If the extension fails to load, no unguarded tools are
+substituted and no result is accepted. The extension is shipped inside the Wheel
+binary; it does not require a separate npm installation. Each Wheel engine
+gets private runtime files so concurrent loads cannot overwrite a running guard.
+
+File tools reject paths outside the canonical repository, symlink paths,
+sensitive files, and protected metadata. Their actual I/O runs inside the same
+mount isolation as shell commands, so a concurrent path change cannot redirect
+I/O onto the host. Shell tools have:
+
+- A writable repository, read-only Git metadata/configuration/dependencies, and
+  read-only system executables/libraries. External hardlinks in the writable
+  source tree are masked; they cannot expose or modify the external inode.
+  Dependency/toolchain mounts are explicitly trusted read-only inputs.
+- Private `/tmp`, HOME, process and network namespaces; no inherited environment
+  credentials, host home directory, or standard Docker/Podman sockets.
+- Masked `.env` variants, private-key files, and credential directories within
+  the repository. Wheel's private metadata is hidden from agent tools.
+- A bounded shell lifetime (five minutes by default, at most thirty minutes).
+  Namespace teardown removes background children when a tool ends. Wheel also
+  kills Pi's process group at session exit/timeout; on Linux Pi is tied to
+  Wheel's lifetime so a killed Wheel does not leave its agent running.
+
+Additional toolchains outside system directories can be explicitly mounted
+read-only. Choose a specific toolchain directory; do not expose home directories
+or credential stores. Its directory and `bin/` are added to the tool PATH:
+
+```toml
+[sandbox]
+read_only_paths = ["/opt/toolchains/node"]
+```
+
+**Validation uses the same isolation by default** (`execution = "sandbox"`).
+This includes agent-edited precheck scripts, package scripts, and test code;
+otherwise an agent could bypass its tool restrictions by editing a test. Each
+validation command has a thirty-minute deadline and managed process cleanup.
+Credentials and host services remain unavailable, and required checks that cannot
+run block completion. Prepare dependencies/toolchains before starting a run.
+
+An explicit `[validation] execution = "trusted_host"` opts out for validation
+only. Wheel warns on every run. This executes agent-modified repository code with
+host filesystem, environment, network, and socket access; use it only in an
+already disposable, trusted VM/container. Its scripts should create and clean up
+disposable databases, never shared or production resources. Do not enable it
+merely to silence a sandbox failure. Agent tools remain isolated in either mode.
+A required integration check must be configured for Wheel or explicitly reported
+as unverified; no automatic host fallback occurs.
+
+The sandbox is a tool boundary, not an isolation wrapper around the Pi runtime.
+Pi still needs its provider credentials and provider network connection. Wheel
+uses trusted Pi code plus its pinned embedded extension; arbitrary Pi extensions
+and built-in tools are disabled during agent sessions.
+
+Transcripts redact known secret environment and root `.env` values, URI
+credentials, and credential fields. Tool results redact URI credentials and
+credential fields before entering model context; secret files/environment are
+withheld from tools in the first place. Redaction is defense in depth, not a
+promise to recognize every possible secret in source code or prose. Existing
+logs are not rewritten. Restrict access to historical logs and review any
+previously exposed credentials separately.
+
+### Enforce specialized validation coverage
+
+`require_rules_for` declares paths that must be covered by a conditional rule.
+If a changed path matches one of these prefixes but no rule, Wheel blocks
+completion. It checks this again after reviewer edits. For example:
+
+```toml
+[validation]
+execution = "sandbox"
+commands = ["./scripts/do-prechecks.py"]
+require_rules_for = ["drizzle/", "src/db/"]
+
+[[validation.rules]]
+path_prefixes = ["drizzle/", "src/db/"]
+commands = ["pnpm migrations:test", "pnpm test:pg:ephemeral"]
+```
+
+The commands are repository-specific examples, not inferred checks or new
+commands supplied by Wheel. Configure actual working test commands before a run.
+A passing generic check does not satisfy an omitted integration test. Empty
+base validation is rejected. Nonempty `unverified_checks` still blocks completion;
+Wheel does not relax that gate to salvage incomplete validation.
 
 ## Work Item selection
 
@@ -384,6 +481,14 @@ Wheel falls back to the existing project-wide query. A sprint discovery or
 item-query error stops selection; it is not treated as an empty sprint.
 An already active Wheel item continues from its checkpoint even if sprint
 membership changes.
+
+Within either pool, Wheel reads candidate context in priority order before
+claiming work. Any `blocked_by` link whose other item is not `done` defers that
+candidate without starting an agent or consuming an item attempt. Ready lower
+priority work can still run. Missing, malformed, or paginated/incomplete links
+stop selection instead of being treated as no dependencies. Dependencies are
+checked again immediately before claim. Already active work still resumes from
+its checkpoint.
 
 Within either pool, candidates are ordered deterministically:
 
@@ -414,17 +519,18 @@ The implementation agent receives the authoritative
 instructed to inspect the repository first, implement the Work Item
 completely, add or update tests, keep changes scoped to the Work Item, and
 continue any partial working-tree changes on a resumed run. It ends with a
-structured `HAMSTIK_WHEEL_RESULT` marker reporting `ready_for_review` or
-`blocked`.
+typed `wheel_result` call reporting `ready_for_review` or `blocked`, with
+explicit `findings` and `unverified_checks` arrays.
 
 The reviewer runs as a **fresh Pi process** with no shared conversation. The
 reviewer independently inspects the Work Item, the Git diff against the
 baseline, the repository architecture, tests, and acceptance criteria, plus
 the pre-review validation evidence — rather than inheriting the implementer's
 assumptions. It is authorized to edit the working tree to fix findings, and it
-also ends with a structured marker: `pass` with zero findings, or `blocked`.
+also submits `wheel_result`: `pass` with zero findings and no unverified checks,
+or `blocked`. The result tool closes further agent tool use.
 
-Wheel parses the structured result marker and terminal provider-error events
+Wheel parses the structured result-tool event and terminal provider-error events
 from each session's event stream. Provider failures retain the configured
 model, resolved model, provider, and error details; they are not mislabeled
 as missing result markers. Model reasoning is not interpreted.
@@ -496,10 +602,13 @@ metadata, Wheel discovers the highest numbered surviving branch. A skipped
 item is no longer active; `resume` applies to active checkpoints, while a
 later `run` or `once` can select skipped work after cooldown.
 
-Every agent attempt and validation report gets an immutable timestamped file
-under `.git/hamstik-wheel/logs/<KEY>/history/`. The usual `implement.log`,
-`review-NN.log`, and validation paths remain aliases containing the latest
-output. Failed final retries are retained as well as first attempts, and
+Every agent attempt and validation report gets a distinct timestamped file
+under `.git/hamstik-wheel/logs/<KEY>/history/`. Agent files are allocated and
+announced before Pi starts, then receive redacted complete events incrementally.
+A killed Wheel therefore leaves the partial attempt available for inspection.
+The usual `implement.log` and `review-NN.log` aliases are updated when a session
+ends; consult the announced history path while it runs. Validation paths remain
+aliases containing the latest completed output. Failed final retries are retained as well as first attempts, and
 older aliases are archived before their first replacement. Use
 `--log-file <PATH>` to capture whole-run progress and terminal failure details.
 

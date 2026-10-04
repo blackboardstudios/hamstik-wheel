@@ -14,7 +14,7 @@ use anyhow::{bail, Context, Result};
 use crate::{
     config::{self, Config},
     git::GitRepo,
-    hamstik::{select_next, HamstikCli, WorkItemSummary},
+    hamstik::{select_next, unresolved_dependencies, HamstikCli, WorkItemSummary},
     logging::Logger,
     pi::{implementation_prompt, provider_failure, review_prompt, PiRunner, ProviderFailure},
     state::{ActiveWorkItem, Phase, SkipRecord, StateStore, WheelState},
@@ -36,7 +36,11 @@ impl LoopEngine {
         let repo = GitRepo::discover()?;
         let config = Config::load(repo.root())?;
         let hamstik = HamstikCli::new(repo.root(), &config.hamstik.cli_path);
-        let pi = PiRunner::new(repo.root());
+        let pi = PiRunner::new(
+            repo.root(),
+            repo.metadata_path("hamstik-wheel/runtime")?,
+            &config.sandbox.read_only_paths,
+        )?;
         let state_path = repo.metadata_path("hamstik-wheel/state.json")?;
         let logs_root = repo.metadata_path("hamstik-wheel/logs")?;
         Ok(Self {
@@ -57,6 +61,15 @@ impl LoopEngine {
     pub fn doctor(&self) -> Result<()> {
         let mut failed = false;
         self.logger.info("Hamstik Wheel Doctor");
+        match self.pi.preflight() {
+            Ok(()) => self
+                .logger
+                .info("✓ Repository tool sandbox available (no host network or sockets)"),
+            Err(error) => {
+                self.logger.error(&format!("✗ Agent isolation: {error:#}"));
+                failed = true;
+            }
+        }
         self.logger.blank();
 
         failed |= !check_process(&self.logger, "git", &["--version"]);
@@ -193,8 +206,10 @@ impl LoopEngine {
         }
 
         if self.config.validation.commands.is_empty() && self.config.validation.rules.is_empty() {
-            self.logger
-                .warn("! No validation commands configured; final gate will rely on review only");
+            self.logger.error(
+                "✗ No validation commands configured; configure required checks before running",
+            );
+            failed = true;
         } else {
             self.logger.info(&format!(
                 "✓ {} base validation command(s), {} conditional rule(s) configured",
@@ -342,6 +357,13 @@ impl LoopEngine {
     }
 
     fn preflight(&self) -> Result<()> {
+        self.pi.preflight()?;
+        if self.config.validation.execution == config::ValidationExecution::TrustedHost {
+            self.logger.warn("! validation.execution=trusted_host: validation executes agent-modified code with host filesystem/network access; use only a disposable trusted environment");
+        }
+        if self.config.validation.commands.is_empty() {
+            bail!("configure at least one base validation command before running; review alone is not a completion gate");
+        }
         require_process("pi", &["--version"])?;
         require_process(&self.config.hamstik.cli_path, &["--version"])?;
         self.hamstik
@@ -406,13 +428,16 @@ impl LoopEngine {
         }
 
         if let Err(error) = self.process_active(&mut state) {
-            let error_text = format!("{error:#}");
+            let error_text =
+                crate::security::Redactor::new(self.repo.root()).text(&format!("{error:#}"));
             state.last_error = Some(error_text.clone());
             let _ = self.store.save(&mut state);
 
             // Provider availability affects every item using this model. Preserve
             // the exact phase and tree instead of throwing away completed work.
-            if error.downcast_ref::<ProviderFailure>().is_some() {
+            if error.downcast_ref::<ProviderFailure>().is_some()
+                || error_text.contains("Wheel tool guard did not initialize")
+            {
                 return Err(error.context("provider unavailable; active checkpoint preserved; run `hamstik-wheel resume` after restoring provider access"));
             }
 
@@ -485,7 +510,7 @@ impl LoopEngine {
                 Some(&sprint.id),
             )?);
         }
-        if let Some(item) = select_next(sprint_candidates) {
+        if let Some(item) = self.first_unblocked(sprint_candidates)? {
             self.logger.info(&format!(
                 "[select] {} selected from active sprint work",
                 item.key
@@ -496,9 +521,27 @@ impl LoopEngine {
             self.logger
                 .info("[select] No eligible active-sprint work; using project-wide selection");
         }
-        Ok(select_next(
-            self.eligible_candidates(state, excluded, None)?,
-        ))
+        self.first_unblocked(self.eligible_candidates(state, excluded, None)?)
+    }
+
+    fn first_unblocked(
+        &self,
+        mut candidates: Vec<WorkItemSummary>,
+    ) -> Result<Option<WorkItemSummary>> {
+        while let Some(item) = select_next(candidates.clone()) {
+            let context = self.hamstik.context(&item.key)?;
+            let dependencies = unresolved_dependencies(&context)?;
+            if dependencies.is_empty() {
+                return Ok(Some(item));
+            }
+            self.logger.info(&format!(
+                "[select] {} deferred: unfinished prerequisites: {}",
+                item.key,
+                dependencies.join(", ")
+            ));
+            candidates.retain(|candidate| candidate.key != item.key);
+        }
+        Ok(None)
     }
 
     fn eligible_candidates(
@@ -662,6 +705,13 @@ impl LoopEngine {
         let context = self.hamstik.context(&current.key)?;
 
         if state.phase == Phase::Selected {
+            let blockers = unresolved_dependencies(&context)?;
+            if !blockers.is_empty() {
+                bail!(
+                    "prerequisites changed before claim: {}",
+                    blockers.join(", ")
+                );
+            }
             self.logger.info(&format!("[claim] {}", current.key));
             self.hamstik.start(&current.key)?;
             if self.config.hamstik.assign_to_me {
@@ -749,6 +799,7 @@ impl LoopEngine {
                     &commands,
                     &self.logger,
                     ValidationKind::Inspection,
+                    self.validation_sandbox(),
                 )?;
                 let full_evidence = report.evidence();
                 let validation_log = self.log_path(&current.key, "pre-review-validation.log");
@@ -855,6 +906,7 @@ impl LoopEngine {
                     &commands,
                     &self.logger,
                     ValidationKind::Final,
+                    self.validation_sandbox(),
                 )?;
                 let final_evidence = final_report.evidence();
                 self.write_log(
@@ -1003,11 +1055,17 @@ impl LoopEngine {
         )
     }
 
+    fn validation_sandbox(&self) -> Option<(&std::path::Path, &str)> {
+        match self.config.validation.execution {
+            config::ValidationExecution::Sandbox => Some(self.pi.sandbox()),
+            config::ValidationExecution::TrustedHost => None,
+        }
+    }
+
     fn validation_commands(&self, baseline: &str) -> Result<Vec<String>> {
-        Ok(self
-            .config
-            .validation
-            .commands_for_paths(&self.repo.changed_paths(baseline)?))
+        let paths = self.repo.changed_paths(baseline)?;
+        self.config.validation.require_coverage(&paths)?;
+        Ok(self.config.validation.commands_for_paths(&paths))
     }
 
     fn log_path(&self, key: &str, name: &str) -> PathBuf {
@@ -1017,12 +1075,21 @@ impl LoopEngine {
     /// Keep an immutable copy of every attempt; the original path remains a
     /// convenient latest-output alias for humans and review prompts.
     fn write_log(&self, key: &str, name: &str, content: &str) -> Result<PathBuf> {
+        let redacted = crate::security::Redactor::new(self.repo.root()).text(content);
+        let content = redacted.as_str();
         let path = self.log_path(key, name);
         let history = path
             .parent()
             .context("log path has no parent directory")?
             .join("history");
-        fs::create_dir_all(&history)?;
+        let mut directories = fs::DirBuilder::new();
+        directories.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directories.mode(0o700);
+        }
+        directories.create(&history)?;
         // Preserve transcripts written by older Wheel versions before replacing
         // their latest-output alias for the first time.
         if path.exists() {
@@ -1042,11 +1109,14 @@ impl LoopEngine {
         let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ");
         for sequence in 0.. {
             let archive = history.join(format!("{stamp}-{sequence}-{name}"));
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&archive)
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&archive) {
                 Ok(mut file) => {
                     file.write_all(content.as_bytes())?;
                     fs::write(&path, content)?;
@@ -1089,10 +1159,18 @@ impl LoopEngine {
         let mut provider_retries = 0;
         let mut process_retried = false;
         loop {
-            let mut run = match self
-                .pi
-                .run(model, prompt, self.agent_timeout(), &self.logger)
-            {
+            let path = self.write_log(key, log, "")?;
+            self.logger.info(&format!(
+                "[agent] {key} live transcript: {}",
+                path.display()
+            ));
+            let mut run = match self.pi.run(
+                model,
+                prompt,
+                self.agent_timeout(),
+                &self.logger,
+                &path,
+            ) {
                 Ok(run) => run,
                 Err(error) => crate::pi::PiRun {
                     transcript:
@@ -1101,7 +1179,13 @@ impl LoopEngine {
                     result: Err(error),
                 },
             };
-            let path = self.write_log(key, log, &run.transcript)?;
+            if fs::metadata(&path)?.len() == 0 {
+                fs::write(
+                    &path,
+                    crate::security::Redactor::new(self.repo.root()).text(&run.transcript),
+                )?;
+            }
+            fs::copy(&path, self.log_path(key, log))?;
             self.logger
                 .info(&format!("[agent] {key} transcript: {}", path.display()));
             match run.result {
@@ -1234,20 +1318,38 @@ fn check_pi_model(model: &str) -> Result<(), String> {
     use std::io::{BufRead, BufReader};
 
     const PROBE_PROMPT: &str = "Reply with the single word: ok.";
-    let mut child = Command::new("pi")
-        .args(["--model", model, "--no-session", "--mode", "json", "-p"])
+    let mut command = Command::new("pi");
+    command
+        .args([
+            "--model",
+            model,
+            "--no-session",
+            "--mode",
+            "json",
+            "--no-tools",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "-p",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("failed to start Pi: {error}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
+        .stderr(Stdio::null());
+    crate::process::configure(&mut command);
+    let mut child = crate::process::ManagedChild(
+        command
+            .spawn()
+            .map_err(|error| format!("failed to start Pi: {error}"))?,
+    );
+    if let Some(mut stdin) = child.0.stdin.take() {
         if let Err(error) = stdin.write_all(PROBE_PROMPT.as_bytes()) {
-            let _ = child.kill();
+            let _ = child.0.kill();
             return Err(format!("failed writing probe prompt to Pi stdin: {error}"));
         }
     }
     let stdout = child
+        .0
         .stdout
         .take()
         .ok_or_else(|| "failed to open Pi stdout".to_string())?;
@@ -1262,10 +1364,10 @@ fn check_pi_model(model: &str) -> Result<(), String> {
             transcript
         })
         .map_err(|error| format!("failed to spawn Pi probe reader thread: {error}"))?;
-    let status = match child.wait() {
+    let status = match child.wait(Some(std::time::Duration::from_secs(30))) {
         Ok(status) => status,
         Err(error) => {
-            let _ = child.kill();
+            let _ = child.0.kill();
             return Err(format!("failed waiting for Pi: {error}"));
         }
     };

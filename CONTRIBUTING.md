@@ -4,6 +4,11 @@ Thanks for helping improve Hamstik Wheel.
 
 ## Development
 
+Linux integration tests require Node.js 22+ at `/usr/bin/node` and Bubblewrap at
+`/usr/bin/bwrap`, with unprivileged user namespaces enabled. `cargo test` runs the
+real sandbox regressions via Node in addition to the Rust tests. The Pi extension
+load check can also be exercised by `hamstik-wheel doctor` with an installed Pi.
+
 ```bash
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings

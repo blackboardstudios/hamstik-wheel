@@ -3,16 +3,21 @@
 
 use std::{
     io::{BufRead, BufReader, Write},
-    path::Path,
-    process::{Child, Command, Stdio},
-    time::{Duration, Instant},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::Duration,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{activity::ActivityTracker, logging::Logger};
+use crate::{
+    activity::ActivityTracker,
+    logging::Logger,
+    process::{self, ManagedChild},
+    security::{self, Redactor},
+};
 
 const RESULT_PREFIX: &str = "HAMSTIK_WHEEL_RESULT=";
 
@@ -124,16 +129,85 @@ pub struct PiRun {
     pub transcript: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PiRunner {
-    repo_root: std::path::PathBuf,
+    repo_root: PathBuf,
+    runtime: PathBuf,
+    sandbox_config: String,
 }
 
 impl PiRunner {
-    pub fn new(repo_root: &Path) -> Self {
-        Self {
+    pub fn new(repo_root: &Path, runtime: PathBuf, read_only_paths: &[String]) -> Result<Self> {
+        let runtime = runtime.join(format!(
+            "{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let sandbox_config = security::prepare_runtime(repo_root, &runtime, read_only_paths)?;
+        Ok(Self {
             repo_root: repo_root.to_path_buf(),
+            runtime,
+            sandbox_config,
+        })
+    }
+
+    pub fn sandbox(&self) -> (&Path, &str) {
+        (&self.runtime, &self.sandbox_config)
+    }
+
+    pub fn preflight(&self) -> Result<()> {
+        security::check_runtime(&self.runtime, &self.sandbox_config)?;
+        let mut command = Command::new("pi");
+        command
+            .current_dir(&self.repo_root)
+            .args([
+                "--no-session",
+                "--mode",
+                "json",
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--no-builtin-tools",
+                "--tools",
+                security::TOOLS,
+                "--extension",
+            ])
+            .arg(self.runtime.join("guard.mjs"))
+            .arg("--wheel-guard-check")
+            .env("HAMSTIK_WHEEL_SANDBOX", &self.sandbox_config)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        process::configure(&mut command);
+        let mut child = ManagedChild(command.spawn().context("failed to verify Pi tool guard")?);
+        let stdout = child.0.stdout.take().unwrap();
+        let stderr = child.0.stderr.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut s = String::new();
+            let _ = BufReader::new(stdout).read_to_string(&mut s);
+            s
+        });
+        let errors = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut s = String::new();
+            let _ = BufReader::new(stderr).read_to_string(&mut s);
+            s
+        });
+        let status = child.wait(Some(Duration::from_secs(20)));
+        let output = reader.join().unwrap_or_default();
+        let errors = errors.join().unwrap_or_default();
+        if !status?.success()
+            || !output.lines().any(|line| {
+                serde_json::from_str::<Value>(line)
+                    .ok()
+                    .is_some_and(|v| v["type"] == "wheel_guard_ready" && v["version"] == 1)
+            })
+        {
+            bail!("Wheel tool guard preflight failed; update Pi to a version supporting custom tools and explicit extensions: {}", Redactor::new(&self.repo_root).text(&errors));
         }
+        Ok(())
     }
 
     pub fn run(
@@ -142,117 +216,113 @@ impl PiRunner {
         prompt: &str,
         timeout: Option<Duration>,
         logger: &Logger,
+        log_path: &Path,
     ) -> Result<PiRun> {
-        let mut child = Command::new("pi")
-            .current_dir(&self.repo_root)
-            .args([
-                "--model",
-                model,
-                "--no-session",
-                "--mode",
-                "json",
-                "-p",
-                "Execute the Hamstik Wheel task supplied on stdin.",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("failed to start Pi with model {model}"))?;
-
-        let write_error = match child
-            .stdin
-            .as_mut()
-            .context("failed to open Pi stdin")?
-            .write_all(prompt.as_bytes())
-        {
-            Ok(()) => None,
-            Err(error) => Some(anyhow!("failed writing prompt to Pi stdin: {error}")),
-        };
-        drop(child.stdin.take());
-
-        let stdout = child.stdout.take().context("failed to open Pi stdout")?;
+        let redactor = Redactor::new(&self.repo_root);
+        let mut log = std::fs::OpenOptions::new().append(true).open(log_path)?;
+        let mut command = Command::new("pi");
+        command.current_dir(&self.repo_root)
+            .args(["--model", model, "--no-session", "--mode", "json",
+                "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes",
+                "--no-builtin-tools", "--tools", security::TOOLS, "--extension"])
+            .arg(self.runtime.join("guard.mjs"))
+            .env("HAMSTIK_WHEEL_SANDBOX", &self.sandbox_config)
+            .args(["-p", "Execute the Hamstik Wheel task supplied on stdin. Use wheel_result as your final tool action."])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        process::configure(&mut command);
+        let mut child = ManagedChild(
+            command
+                .spawn()
+                .with_context(|| format!("failed to start Pi with model {model}"))?,
+        );
+        let mut stdin = child.0.stdin.take().context("failed to open Pi stdin")?;
+        let prompt = format!("{}\nRepository root: {}. All file and shell operations must use the wheel_* tools. Shell tools have no host network, credentials, Docker sockets, or writable host paths outside this repository. Do not try to bypass isolation. Required database/browser checks belong in Wheel's configured validation commands. Submit wheel_result with all unverified required checks as your final tool action; prose alone is not a verdict.\n", prompt, self.repo_root.display());
+        // Drain output and write input concurrently so pipe pressure cannot
+        // prevent the wall-clock deadline from being enforced.
+        let writer = std::thread::spawn(move || stdin.write_all(prompt.as_bytes()));
+        let stdout = child.0.stdout.take().context("failed to open Pi stdout")?;
+        let stderr = child.0.stderr.take().context("failed to open Pi stderr")?;
+        let error_redactor = redactor.clone();
+        let mut error_log = log.try_clone()?;
+        let error_reader = std::thread::spawn(move || -> Result<()> {
+            for line in BufReader::new(stderr).lines() {
+                let line = error_redactor.text(&line?);
+                let event = serde_json::json!({"type":"wheel_stderr", "text":line});
+                error_log.write_all(format!("{event}\n").as_bytes())?;
+                error_log.flush()?;
+            }
+            Ok(())
+        });
         let tracker = ActivityTracker::start(logger.activity_enabled());
         let activity = tracker.handle();
-
-        // Collect stdout on a dedicated thread. This lets the main thread
-        // enforce a wall-clock deadline: the reader always drains the stream
-        // to completion while wait-with-timeout decides when to kill Pi.
-        let reader_thread = std::thread::Builder::new()
-            .name("pi-stdout".to_string())
-            .spawn(move || {
-                let reader = BufReader::new(stdout);
-                let mut transcript = String::new();
-                for line in reader.lines() {
-                    match line {
-                        Ok(line) => {
-                            if let Some(update) = crate::activity::description_from_event(&line) {
-                                activity.update(update);
-                            }
-                            transcript.push_str(&line);
-                            transcript.push('\n');
-                        }
-                        Err(_) => break,
+        let reader = std::thread::spawn(move || -> Result<String> {
+            let mut transcript = String::new();
+            for line in BufReader::new(stdout).lines() {
+                if let Some(line) = redactor.event(&line?) {
+                    if let Some(update) = crate::activity::description_from_event(&line) {
+                        activity.update(update);
                     }
+                    // Append complete redacted events as they arrive, before
+                    // parsing the result. Interrupted sessions remain inspectable.
+                    log.write_all(format!("{line}\n").as_bytes())?;
+                    log.flush()?;
+                    transcript.push_str(&line);
+                    transcript.push('\n');
                 }
-                transcript
-            })
-            .context("failed to spawn Pi stdout reader thread")?;
-
-        // Wait for Pi with an optional hard wall-clock limit. On timeout the
-        // process is killed; the reader thread still drains the pipe to EOF.
-        let wait_error = match timeout {
-            None => match child.wait() {
-                Ok(_) => None,
-                Err(error) => Some(anyhow!("failed waiting for Pi: {error}")),
-            },
-            Some(limit) => match wait_with_timeout(&mut child, limit) {
-                Ok(()) => None,
-                Err(error) => Some(anyhow!(
-                    "Pi model {model} exceeded the session timeout of {}s: {error}",
-                    limit.as_secs()
-                )),
-            },
-        };
-
-        let transcript = reader_thread.join().unwrap_or_default();
+            }
+            Ok(transcript)
+        });
+        let status = child.wait(timeout);
+        let write_result = writer
+            .join()
+            .map_err(|_| anyhow!("Pi stdin writer panicked"))?;
+        let transcript = reader
+            .join()
+            .map_err(|_| anyhow!("Pi output reader panicked"))??;
+        error_reader
+            .join()
+            .map_err(|_| anyhow!("Pi stderr reader panicked"))??;
         tracker.finish();
-
-        let status = child.wait().context("failed waiting for Pi")?;
-        let result = if let Some(error) = write_error.or(wait_error) {
-            Err(error)
-        } else if let Some(error) = provider_failure(&transcript, model) {
-            Err(error.into())
-        } else if !status.success() {
-            Err(anyhow!(
+        let result = match status {
+            Err(error) => Err(error.context(format!(
+                "Pi model {model} exceeded the session timeout or failed"
+            ))),
+            Ok(status) if !status.success() => Err(anyhow!(
                 "Pi model {model} exited with status {:?}",
                 status.code()
-            ))
-        } else {
-            parse_agent_result(&transcript)
-                .with_context(|| format!("Pi model {model} returned invalid result output"))
+            )),
+            Ok(_) => {
+                if let Some(failure) = provider_failure(&transcript, model) {
+                    Err(failure.into())
+                } else if write_result.is_err() {
+                    Err(anyhow!("failed writing prompt to Pi stdin"))
+                } else if !transcript.lines().any(|line| {
+                    serde_json::from_str::<Value>(line)
+                        .ok()
+                        .is_some_and(|e| e["type"] == "wheel_guard_ready" && e["version"] == 1)
+                }) {
+                    Err(anyhow!(
+                        "Wheel tool guard did not initialize; refusing an unguarded session"
+                    ))
+                } else if !transcript.lines().any(|line| {
+                    serde_json::from_str::<Value>(line)
+                        .ok()
+                        .is_some_and(|e| e["type"] == "wheel_result")
+                }) {
+                    Err(anyhow!("Pi output did not contain HAMSTIK_WHEEL_RESULT/wheel_result; submit the wheel_result tool"))
+                } else {
+                    parse_agent_result(&transcript)
+                        .with_context(|| format!("Pi model {model} returned invalid result output"))
+                }
+            }
         };
-
         Ok(PiRun { result, transcript })
     }
 }
 
-/// Wait for a child process with a wall-clock limit, killing it (and its
-/// process group) when the limit elapses. Requires the child spawned with
-/// `kill_on_drop`-like handling; std lacks this, so we poll.
-fn wait_with_timeout(child: &mut Child, limit: Duration) -> Result<()> {
-    let deadline = Instant::now() + limit;
-    loop {
-        if let Some(status) = child.try_wait().context("failed polling Pi status")? {
-            let _ = status;
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("session terminated after exceeding the wall-clock limit");
-        }
-        std::thread::sleep(Duration::from_millis(250));
+impl Drop for PiRunner {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.runtime);
     }
 }
 
@@ -280,11 +350,7 @@ Your responsibilities:
 9. If requirements are materially ambiguous/conflicting or safe completion is impossible, stop without inventing requirements.
 10. Identify validation required by repository instructions and the changed behavior (including populated database migrations and integration tests). Do not assume Wheel's generic prechecks include these. If a required check cannot run and is not explicitly scheduled in the Wheel validation commands supplied below, return blocked and list it in unverified_checks. Never hide unrun required checks in prose while returning ready_for_review.
 
-At the very end of your response output exactly one machine-readable line in one of these forms:
-HAMSTIK_WHEEL_RESULT={{"status":"ready_for_review","summary":"brief summary","findings":[],"unverified_checks":[]}}
-HAMSTIK_WHEEL_RESULT={{"status":"blocked","summary":"why work cannot safely continue","findings":["blocking reason"],"unverified_checks":["required check that could not run, if any"]}}
-
-Do not put Markdown fences around the marker line.
+Your final tool action MUST call wheel_result. Supply status ready_for_review or blocked, a concrete summary, findings, and unverified_checks (both arrays are required even when empty). Do not merely print a marker or verdict in prose. No editing or checks are possible after you submit the result.
 "#,
         serde_json::to_string_pretty(context).unwrap_or_else(|_| context.to_string())
     )
@@ -310,7 +376,7 @@ Do not trust conclusions from the implementation agent. Independently inspect th
 HAMSTIK_CONTEXT_JSON:
 {}
 
-PREVIOUS_VALIDATION_EVIDENCE (digested; full untruncated output is in .git/hamstik-wheel/logs/{key}/ under Git metadata — read it from there if you need more detail):
+PREVIOUS_VALIDATION_EVIDENCE (redacted digest; private Wheel metadata is unavailable to agent tools):
 {validation_evidence}
 
 Budget your work: you have a hard session wall-clock limit. Inspect the diff (`git diff {baseline}`), read the files it touches and relevant dependencies, and do not dump large outputs to the console.
@@ -333,23 +399,35 @@ Work within the session wall-clock limit:
 - Inspect `git diff {baseline}` first; read touched files and relevant dependencies.
 - Do NOT run full-repository verification: never run precheck scripts, `cargo fmt --all`, `cargo clippy --workspace`, `cargo build --workspace --release`, or the whole test suite. Hamstik Wheel runs the configured validation commands after implementation and again after your review. Do not treat a passing configured suite as evidence for checks it does not include. If a required check is absent from the supplied evidence and is not explicitly scheduled for final validation, return blocked with unverified_checks. Never return pass with required validation missing.
 - Prefer targeted checks: `cargo check -p <touched-crate> --all-targets` or `cargo test -p <touched-crate> --test <relevant-test>`.
-- Prefer small, decisive fixes over exploratory loops. If time expires before all requirements can be verified, emit a blocked marker with the unresolved findings.
+- Prefer small, decisive fixes over exploratory loops. If time expires before all requirements can be verified, submit a blocked wheel_result with the unresolved findings.
 
 Do NOT change Hamstik Work Item status/comments and do NOT create a Git commit. Hamstik Wheel owns those actions.
 
-At the very end of your response output exactly one machine-readable line:
-HAMSTIK_WHEEL_RESULT={{"status":"pass","summary":"brief independent review summary","findings":[],"unverified_checks":[]}}
-
-If safe completion is impossible instead output:
-HAMSTIK_WHEEL_RESULT={{"status":"blocked","summary":"why review cannot pass","findings":["unresolved finding"],"unverified_checks":["required check that could not run, if any"]}}
-
-Return status `pass` only when there are zero unresolved actionable findings. Do not put Markdown fences around the marker line.
+Your final tool action MUST call wheel_result with status pass or blocked, a concrete independent-review summary, findings, and unverified_checks. Both arrays must be present. Return pass only with zero unresolved findings and zero unverified required checks. Do not merely print a marker or verdict in prose. No editing or checks are possible after submission.
 "#,
         serde_json::to_string_pretty(context).unwrap_or_else(|_| context.to_string())
     )
 }
 
 pub fn parse_agent_result(output: &str) -> Result<AgentResult> {
+    for line in output.lines().rev() {
+        if let Ok(event) = serde_json::from_str::<Value>(line) {
+            if event["type"] == "wheel_result" {
+                if !event["result"]["findings"].is_array()
+                    || !event["result"]["unverified_checks"].is_array()
+                    || !event["result"]["summary"].is_string()
+                {
+                    bail!("wheel_result must explicitly declare findings, summary, and unverified_checks");
+                }
+                let result: AgentResult = serde_json::from_value(event["result"].clone())
+                    .context("wheel_result contained invalid result")?;
+                if !["ready_for_review", "pass", "blocked"].contains(&result.status.as_str()) {
+                    bail!("invalid wheel_result status");
+                }
+                return Ok(result);
+            }
+        }
+    }
     // The transcript is the NDJSON event stream from `pi --mode json`. The
     // marker is emitted inside the final assistant text, so it arrives
     // JSON-escaped in the last event; search every line for any occurrence.
@@ -437,10 +515,8 @@ fn collect_assistant_texts(value: &Value, texts: &mut Vec<String>) {
             if map.get("role").and_then(Value::as_str) == Some("assistant") {
                 if let Some(content) = map.get("content").and_then(Value::as_array) {
                     for item in content {
-                        for field in ["text", "thinking"] {
-                            if let Some(text) = item.get(field).and_then(Value::as_str) {
-                                texts.push(text.to_string());
-                            }
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            texts.push(text.to_string());
                         }
                     }
                 }

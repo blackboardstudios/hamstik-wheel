@@ -8,6 +8,8 @@ mod hamstik;
 mod logging;
 mod loop_engine;
 mod pi;
+mod process;
+mod security;
 mod state;
 mod validation;
 
@@ -86,7 +88,8 @@ enum Commands {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("error: {error:#}");
+        let redactor = security::Redactor::new(&std::env::current_dir().unwrap_or_default());
+        eprintln!("error: {}", redactor.text(&format!("{error:#}")));
         std::process::exit(1);
     }
 }

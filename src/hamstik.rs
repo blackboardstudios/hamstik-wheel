@@ -539,3 +539,60 @@ mod tests {
         );
     }
 }
+
+/// Context links are authoritative, including pagination. Never treat an
+/// incomplete/unknown dependency status as permission to start work.
+pub fn unresolved_dependencies(context: &Value) -> Result<Vec<String>> {
+    let links = context
+        .get("links")
+        .context("context bundle is missing dependency links")?;
+    if links.pointer("/page/hasMore").and_then(Value::as_bool) != Some(false) {
+        bail!("context dependency links are incomplete; refusing selection");
+    }
+    let entries = links
+        .get("items")
+        .and_then(Value::as_array)
+        .context("context links.items must be an array")?;
+    let mut blockers = Vec::new();
+    for entry in entries {
+        let relation = entry
+            .get("relation")
+            .and_then(Value::as_str)
+            .context("context link is missing relation")?;
+        if relation == "blocked_by" {
+            let other = &entry["otherWorkItem"];
+            if other.get("status").and_then(Value::as_str) != Some("done") {
+                blockers.push(
+                    other
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unavailable dependency")
+                        .to_string(),
+                );
+            }
+        }
+    }
+    blockers.sort();
+    blockers.dedup();
+    Ok(blockers)
+}
+
+#[cfg(test)]
+mod dependency_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn blocks_incomplete_links_and_unfinished_prerequisites() {
+        assert!(unresolved_dependencies(&json!({})).is_err());
+        assert!(
+            unresolved_dependencies(&json!({"links":{"items":[],"page":{"hasMore":true}}}))
+                .is_err()
+        );
+        let context = json!({"links":{"items":[
+            {"relation":"blocked_by","otherWorkItem":{"key":"TEST-1","status":"todo"}},
+            {"relation":"blocked_by","otherWorkItem":{"key":"TEST-2","status":"done"}},
+            {"relation":"blocks","otherWorkItem":{"key":"TEST-3","status":"todo"}}
+        ],"page":{"hasMore":false}}});
+        assert_eq!(unresolved_dependencies(&context).unwrap(), vec!["TEST-1"]);
+    }
+}

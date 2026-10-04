@@ -121,17 +121,32 @@ pub fn run_all(
     commands: &[String],
     logger: &Logger,
     kind: ValidationKind,
+    sandbox: Option<(&Path, &str)>,
 ) -> Result<ValidationReport> {
     let mut results = Vec::new();
     let mut all_pass = true;
     let tag = kind.tag();
+    let redactor = crate::security::Redactor::new(repo_root);
 
     for command in commands {
         logger.info(&format!("[{tag}] $ {command}"));
-        let output = shell_command(repo_root, command)
+        let mut subprocess = match sandbox {
+            Some((runtime, config)) => {
+                let mut child = Command::new("node");
+                child
+                    .current_dir(repo_root)
+                    .arg(runtime.join("sandbox.mjs"))
+                    .arg("--run")
+                    .arg(command)
+                    .env("HAMSTIK_WHEEL_SANDBOX", config);
+                child
+            }
+            None => shell_command(repo_root, command),
+        };
+        let output = crate::process::output(&mut subprocess, std::time::Duration::from_secs(1800))
             .with_context(|| format!("failed to execute validation command: {command}"))?;
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let stdout = redactor.text(&String::from_utf8_lossy(&output.stdout));
+        let stderr = redactor.text(&String::from_utf8_lossy(&output.stderr));
         if logger.verbose() {
             if !stdout.is_empty() {
                 print!("{stdout}");
@@ -170,19 +185,17 @@ pub fn run_all(
 }
 
 #[cfg(unix)]
-fn shell_command(repo_root: &Path, command: &str) -> Result<std::process::Output> {
-    Ok(Command::new("sh")
-        .current_dir(repo_root)
-        .args(["-lc", command])
-        .output()?)
+fn shell_command(repo_root: &Path, command: &str) -> Command {
+    let mut child = Command::new("sh");
+    child.current_dir(repo_root).args(["-lc", command]);
+    child
 }
 
 #[cfg(windows)]
-fn shell_command(repo_root: &Path, command: &str) -> Result<std::process::Output> {
-    Ok(Command::new("cmd")
-        .current_dir(repo_root)
-        .args(["/C", command])
-        .output()?)
+fn shell_command(repo_root: &Path, command: &str) -> Command {
+    let mut child = Command::new("cmd");
+    child.current_dir(repo_root).args(["/C", command]);
+    child
 }
 
 #[cfg(test)]
@@ -193,7 +206,7 @@ mod tests {
     fn empty_validation_set_is_vacuously_passed() {
         let dir = tempfile::tempdir().unwrap();
         let logger = Logger::new(crate::logging::TimestampMode::None, None, false).unwrap();
-        let report = run_all(dir.path(), &[], &logger, ValidationKind::Inspection).unwrap();
+        let report = run_all(dir.path(), &[], &logger, ValidationKind::Inspection, None).unwrap();
         assert!(report.passed);
     }
 
@@ -219,7 +232,14 @@ mod tests {
         #[cfg(windows)]
         let command = "type validator-output.txt & exit /b 1".to_string();
 
-        let report = run_all(dir.path(), &[command], &logger, ValidationKind::Inspection).unwrap();
+        let report = run_all(
+            dir.path(),
+            &[command],
+            &logger,
+            ValidationKind::Inspection,
+            None,
+        )
+        .unwrap();
 
         assert!(!report.passed);
         assert!(report.commands[0]

@@ -21,6 +21,7 @@ pub enum TimestampMode {
 #[derive(Debug)]
 pub struct Logger {
     timestamps: TimestampMode,
+    redactor: crate::security::Redactor,
     log_file_path: Option<PathBuf>,
     verbose: bool,
     activity_enabled: bool,
@@ -50,6 +51,7 @@ impl Logger {
         let activity_enabled = log_file.is_none() && is_stdout_tty();
         Ok(Self {
             timestamps,
+            redactor: crate::security::Redactor::new(&std::env::current_dir()?),
             log_file_path: log_file.map(Path::to_path_buf),
             verbose,
             activity_enabled,
@@ -74,6 +76,7 @@ impl Logger {
     }
 
     pub fn line(&self, stream: Stream, message: &str) {
+        let message = self.redactor.text(message);
         let stamp = self.render_stamp();
         let rendered = match stamp {
             Some(stamp) => format!("{stamp} {message}"),
@@ -127,6 +130,7 @@ impl Logger {
         if text.is_empty() {
             return;
         }
+        let text = self.redactor.text(text);
         let mut guard = match self.file.lock() {
             Ok(guard) => guard,
             Err(_) => return,
