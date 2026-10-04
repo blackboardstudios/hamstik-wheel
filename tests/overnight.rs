@@ -164,6 +164,7 @@ case "$1 $2" in
   'work start') echo "$3" >> .git/starts; echo '{}';;
   'work view') echo '{"status":"in_progress"}';;
   'work close')
+    if [ "$TEST_MODE" = 'close-fails' ]; then echo 'close unavailable' >&2; exit 1; fi
     echo "$3" >> .git/closes
     if [ -f .git/drain-sprint ]; then echo '{"items":[]}' > ".git/sprint-$(cat .git/drain-sprint).json"; fi
     echo '{}';;
@@ -329,6 +330,11 @@ fn skip_advances_and_cooldown_does_not_hide_other_candidates() {
     );
     assert_eq!(f.read(".git/starts"), "TEST-1\nTEST-2\n");
     assert_eq!(f.read(".git/closes"), "TEST-2\n");
+    let progress = f.run(&["--no-timestamps", "progress-report"], "skip");
+    assert!(progress.status.success());
+    let progress = String::from_utf8(progress.stdout).unwrap();
+    assert!(progress.contains("Skipped TEST-1 — First"), "{progress}");
+    assert!(progress.contains("Completed TEST-2 — Second"), "{progress}");
     assert_eq!(f.state()["completedThisRun"], 1);
     assert_eq!(f.state()["skipLedger"][0]["wipBranch"], "wheel/wip/TEST-1");
     assert_eq!(
@@ -340,6 +346,27 @@ fn skip_advances_and_cooldown_does_not_hide_other_candidates() {
     let output = f.run(&["once"], "skip");
     assert!(output.status.success());
     assert_eq!(f.read(".git/starts"), "TEST-2\n");
+}
+
+#[test]
+fn failed_close_is_never_recorded_as_completed_even_after_validation_passes() {
+    let f = Fixture::new();
+    assert!(f.run(&["once"], "close-fails").status.success());
+    assert!(f
+        .read(".git/hamstik-wheel/logs/TEST-1/final-validation-01.log")
+        .starts_with("overall: PASS"));
+    let journal = f.read(".git/hamstik-wheel/logs/progress.jsonl");
+    let events: Vec<Value> = journal
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(events.iter().any(|e| e["kind"] == "started"));
+    assert!(events.iter().any(|e| e["kind"] == "failed"));
+    assert!(!events.iter().any(|e| e["kind"] == "completed"));
+    let output = f.run(&["--no-timestamps", "progress-report"], "close-fails");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Skipped TEST-1"));
 }
 
 #[test]

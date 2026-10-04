@@ -9,6 +9,7 @@ mod logging;
 mod loop_engine;
 mod pi;
 mod process;
+mod progress;
 mod security;
 mod state;
 mod validation;
@@ -84,6 +85,8 @@ enum Commands {
     Resume,
     /// Show persisted orchestration state.
     Status,
+    /// Summarize the latest recorded progress for each Work Item from local logs.
+    ProgressReport,
 }
 
 fn main() {
@@ -116,6 +119,7 @@ fn run() -> Result<()> {
         Commands::Run { max_items } => LoopEngine::load_with_logger(&logger)?.run(max_items),
         Commands::Resume => LoopEngine::load_with_logger(&logger)?.resume(),
         Commands::Status => LoopEngine::load_with_logger(&logger)?.status(),
+        Commands::ProgressReport => progress::report(&GitRepo::discover()?, &logger),
     }
     .context("Hamstik Wheel command failed");
     if let Err(error) = &result {

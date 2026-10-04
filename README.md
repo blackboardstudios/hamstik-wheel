@@ -179,7 +179,7 @@ Today Hamstik Wheel provides:
   with an optional `--log-file <PATH>` mirror of the whole run;
 - `--max-items`, `max_review_cycles`, and the unattended-resilience options
   (`on_failure`, `agent_timeout_minutes`, `implement_retry`);
-- `init`, `doctor`, `once`, `run`, `resume`, and `status`;
+- `init`, `doctor`, `once`, `run`, `resume`, `status`, and `progress-report`;
 - `--timestamps` and `--log-file` output logging options.
 
 Release packaging, a `docs/` tree, and multi-agent scale-out are future work;
@@ -195,10 +195,49 @@ concurrency beyond one Work Item is a non-goal by design.
 | `hamstik-wheel run --max-items N` | Process Work Items sequentially until the requested/configured limit or no work remains |
 | `hamstik-wheel resume` | Resume the interrupted active Work Item; errors when nothing is active |
 | `hamstik-wheel status` | Show persisted loop state: phase, Work Item, baseline SHA, review cycle, last error, skip ledger |
+| `hamstik-wheel progress-report` | Summarize the latest recorded progress for each Work Item from this repository's local logs and checkpoints |
 
 `run` and `once` automatically resume an active Work Item before selecting a
 new one; `resume` exists for when that should be the only thing that happens.
 `--max-items` is optional and defaults to `[loop].max_items`.
+
+### Review progress
+
+From the repository root or any subdirectory, run:
+
+```bash
+hamstik-wheel progress-report
+# Without output timestamps:
+hamstik-wheel --no-timestamps progress-report
+```
+
+The report shows one line per Work Item, ordered from oldest to newest recorded
+activity. For example:
+
+```text
+Completed TEST-1 — Add export support (commit abc123; closed)
+Skipped TEST-2 — Improve search (review-failed)
+Started TEST-3 — Update help (implementation)
+```
+
+Other stages include `Reviewing`, `Validating`, `Failed`, and `Deferred`.
+This is an offline report of recorded activity, not a live Hamstik status query
+or proof that a worker process is still running. It reads the current worktree's
+Git metadata without starting agents, loading Wheel configuration, changing
+checkpoints, or requiring Pi, Bubblewrap, or Hamstik credentials.
+
+New runs automatically append redacted lifecycle events to
+`hamstik-wheel/logs/progress.jsonl` under Git metadata, independently of
+`--log-file`. `Completed` is recorded only after Hamstik confirms the close
+command succeeded. A later attempt replaces the earlier status in the report;
+the journal retains both. Incomplete or invalid journal records produce a
+warning while valid records remain reportable.
+
+For older runs, the report uses existing implementation, review, validation
+logs, and the active/skip checkpoints. Old validation logs that passed appear
+as `Validated … (final validation passed; completion not recorded)` because
+those logs do not prove the Work Item was closed. Agent prose is never used as
+completion evidence. No historical logs are rewritten.
 
 ## Output logging
 

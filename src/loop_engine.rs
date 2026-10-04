@@ -17,6 +17,7 @@ use crate::{
     hamstik::{select_next, unresolved_dependencies, HamstikCli, WorkItemSummary},
     logging::Logger,
     pi::{implementation_prompt, provider_failure, review_prompt, PiRunner, ProviderFailure},
+    progress::{self, Event, Kind},
     state::{ActiveWorkItem, Phase, SkipRecord, StateStore, WheelState},
     validation::{run_all, ValidationKind},
 };
@@ -32,6 +33,26 @@ pub struct LoopEngine {
 }
 
 impl LoopEngine {
+    fn record_progress(&self, kind: Kind, key: &str, title: &str, detail: &str) {
+        let event = Event {
+            timestamp: chrono::Utc::now(),
+            kind,
+            key: key.to_string(),
+            title: title.to_string(),
+            detail: detail.to_string(),
+        };
+        if let Err(error) = progress::append(
+            &self.logs_root,
+            &event,
+            &crate::security::Redactor::new(self.repo.root()),
+        ) {
+            // Reporting must not turn a successful external transition into a
+            // skip or discard preserved work. Surface missing evidence instead.
+            self.logger
+                .warn(&format!("Could not record progress for {key}: {error:#}"));
+        }
+    }
+
     pub fn load_with_logger(logger: &Logger) -> Result<Self> {
         let repo = GitRepo::discover()?;
         let config = Config::load(repo.root())?;
@@ -432,6 +453,9 @@ impl LoopEngine {
                 crate::security::Redactor::new(self.repo.root()).text(&format!("{error:#}"));
             state.last_error = Some(error_text.clone());
             let _ = self.store.save(&mut state);
+            if let Some(active) = &state.current {
+                self.record_progress(Kind::Failed, &active.key, &active.title, &error_text);
+            }
 
             // Provider availability affects every item using this model. Preserve
             // the exact phase and tree instead of throwing away completed work.
@@ -480,6 +504,7 @@ impl LoopEngine {
                     skipped_at: chrono::Utc::now(),
                 };
                 self.store.finish_skip(&mut state, record)?;
+                self.record_progress(Kind::Skipped, &key, &title, &classify_failure(&error_text));
                 self.logger.info(&format!(
                     "[skip] {key} recorded; item returned to the eligible pool; continuing"
                 ));
@@ -539,6 +564,12 @@ impl LoopEngine {
                 item.key,
                 dependencies.join(", ")
             ));
+            self.record_progress(
+                Kind::Deferred,
+                &item.key,
+                &item.title,
+                &format!("unfinished prerequisites: {}", dependencies.join(", ")),
+            );
             candidates.retain(|candidate| candidate.key != item.key);
         }
         Ok(None)
@@ -631,7 +662,7 @@ impl LoopEngine {
         let (wip_branch, wip_sha) = self.latest_wip(&key)?;
         let record = SkipRecord {
             key: key.clone(),
-            title,
+            title: title.clone(),
             reason: "interrupted-cleanup".to_string(),
             model: active_model(&error_text),
             wip_branch,
@@ -639,6 +670,12 @@ impl LoopEngine {
             skipped_at: chrono::Utc::now(),
         };
         self.store.finish_skip(state, record)?;
+        self.record_progress(
+            Kind::Skipped,
+            &key,
+            &title,
+            "interrupted skip cleanup recovered",
+        );
         self.logger.info(&format!(
             "[recover] {key}: skip completed; item returned to the eligible pool"
         ));
@@ -714,6 +751,12 @@ impl LoopEngine {
             }
             self.logger.info(&format!("[claim] {}", current.key));
             self.hamstik.start(&current.key)?;
+            self.record_progress(
+                Kind::Started,
+                &current.key,
+                &current.title,
+                "claimed for implementation",
+            );
             if self.config.hamstik.assign_to_me {
                 self.hamstik.assign_to_me(&current.key)?;
             }
@@ -742,6 +785,12 @@ impl LoopEngine {
         if matches!(state.phase, Phase::Claimed | Phase::Implementing) {
             state.phase = Phase::Implementing;
             self.store.save(state)?;
+            self.record_progress(
+                Kind::Started,
+                &current.key,
+                &current.title,
+                "implementation",
+            );
             self.logger.blank();
             self.logger.info(&format!(
                 "[implement] {} with {}",
@@ -791,6 +840,12 @@ impl LoopEngine {
             Phase::PreReviewValidation | Phase::Reviewing | Phase::FinalValidation
         ) {
             let (mut evidence, mut review_tag) = if state.phase == Phase::PreReviewValidation {
+                self.record_progress(
+                    Kind::Validating,
+                    &current.key,
+                    &current.title,
+                    "pre-review checks",
+                );
                 self.logger.blank();
                 self.logger.info("[inspect] pre-review checks");
                 let commands = self.validation_commands(&current.baseline_sha)?;
@@ -831,6 +886,12 @@ impl LoopEngine {
                 state.review_cycle = cycle;
                 state.phase = Phase::Reviewing;
                 self.store.save(state)?;
+                self.record_progress(
+                    Kind::Reviewing,
+                    &current.key,
+                    &current.title,
+                    &format!("review cycle {cycle}"),
+                );
                 self.logger.blank();
                 self.logger.info(&format!(
                     "[{review_tag}] cycle {cycle}/{} with {}",
@@ -897,6 +958,12 @@ impl LoopEngine {
 
                 state.phase = Phase::FinalValidation;
                 self.store.save(state)?;
+                self.record_progress(
+                    Kind::Validating,
+                    &current.key,
+                    &current.title,
+                    &format!("final checks, cycle {cycle}"),
+                );
                 self.logger.blank();
                 self.logger
                     .info(&format!("[validate] final checks for cycle {cycle}"));
@@ -1028,6 +1095,15 @@ impl LoopEngine {
             self.logger
                 .info(&format!("[complete] closing {}", current.key));
             self.hamstik.close(&current.key)?;
+            self.record_progress(
+                Kind::Completed,
+                &current.key,
+                &current.title,
+                &match commit_sha.as_deref() {
+                    Some(sha) => format!("commit {sha}; closed"),
+                    None => "closed; changes left uncommitted by configuration".to_string(),
+                },
+            );
 
             state.completed_this_run += 1;
             // The item completed; its skip history is no longer relevant.
