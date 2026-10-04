@@ -220,7 +220,10 @@ Skipped TEST-2 — Improve search (review-failed)
 Started TEST-3 — Update help (implementation)
 ```
 
-Other stages include `Reviewing`, `Validating`, `Failed`, and `Deferred`.
+Other stages include `Reviewing`, `Validating`, `Failed`, `Deferred`, `Paused`,
+and `Release pending`. `Paused` means local work is retained but the remote
+status claim has been released. `Release pending` or `Skipping` means cleanup
+must finish before Wheel moves on; `resume` retries it.
 This is an offline report of recorded activity, not a live Hamstik status query
 or proof that a worker process is still running. It reads the current worktree's
 Git metadata without starting agents, loading Wheel configuration, changing
@@ -602,15 +605,17 @@ that still reports findings is fed into the next remediation cycle, as is a
 nonzero final validation result. Every command must exit 0 at the final gate.
 Review/remediation repeats up to `max_review_cycles`; only an exhausted or
 blocked loop is reported as failed. Wheel then leaves the Work Item open and
-keeps its active state for `resume` in halt mode, or preserves WIP and skips
-the item in skip mode.
+keeps its local checkpoint/work for `resume` and releases its remote status claim
+in halt mode, or preserves WIP and skips the item in skip mode.
 
 ### Unattended runs
 
 `[loop].on_failure = "skip"` records item-specific failures (process/protocol
 errors, timeouts, blocked results, or exhausted review), preserves changes on
-a `wheel/wip/<KEY>` branch, restores the baseline, and attempts to return the
-item to `todo`. That key is excluded for the rest of the run, so Wheel can
+a `wheel/wip/<KEY>` branch, restores the baseline, and returns the item to the
+status recorded immediately before claiming it. Wheel reads the actual status
+before claiming; it does not assume `todo` or rely on a stale candidate list.
+That key is excluded for the rest of the run, so Wheel can
 select the next candidate. `max_items` counts completed plus skipped items.
 
 Across invocations, skipped items have a 30-minute cooldown. Changing the
@@ -624,8 +629,9 @@ may be affected. Rate limits and transient provider errors receive bounded
 exponential retries. Authentication and other non-transient provider errors
 stop immediately. After provider retries are exhausted, Wheel stops with a
 nonzero exit **even with `on_failure = "skip"`**, retaining the active phase
-and working tree. Restore provider access or change the configured model,
-then run `hamstik-wheel resume`: a failed reviewer resumes review without
+and working tree while restoring the pre-claim remote status. Restore provider
+access or change the configured model, then run `hamstik-wheel resume`: Wheel
+reclaims the item, and a failed reviewer resumes review without
 repeating implementation or consuming another review cycle.
 
 Implementation process/protocol errors get one additional session when
@@ -633,8 +639,33 @@ Implementation process/protocol errors get one additional session when
 An explicit `blocked` result is not retried within the phase. Provider retry
 budgets apply independently of `implement_retry`.
 
-Wheel persists a `Skipping` phase before cleanup and recovers interrupted
-cleanup on the next invocation. The skip ledger records the exact WIP branch
+Wheel persists a `Skipping` phase before skip cleanup and a `releasePending`
+intent before pausing a claim. It verifies the remote status after a transition;
+failed reads, failed transitions, and unconfirmed transitions stop the run with
+the active checkpoint retained. It never records a completed skip or selects
+another item while that cleanup is pending. `resume`, `once`, and `run` retry
+pending cleanup **before model/sandbox preflight**, so a provider outage does
+not block status restoration. Resuming an interrupted skip only finishes that
+skip; it does not claim a different item.
+
+If another actor has already moved the item out of `in_progress`, Wheel leaves
+that status untouched. It refuses to reclaim an item that moved away from its
+recorded pre-claim status while paused. Old checkpoints may lack that status:
+if the item is still `in_progress`, Wheel stops rather than guessing; restore
+the intended status manually, then resume cleanup. Wheel also refuses to take
+over a newly selected item already in progress without a known return status.
+Claim intent and successful acknowledgement are persisted separately. If a
+start request loses its response or a crash leaves only the intent record,
+`in_progress` alone cannot establish ownership: Wheel keeps cleanup pending
+and requires manual status resolution instead of risking release of someone
+else's claim. Likewise, terminal statuses are never automatically reopened.
+
+A forced process kill, terminal interruption, or machine failure cannot be
+guaranteed to restore remote state immediately. The durable checkpoint remains
+available for the next invocation; `status` alone is a read-only inspection and
+does not run recovery. An `Implementing` checkpoint is not proof of a live worker.
+
+The skip ledger records the exact WIP branch
 and commit. Future implementation prompts identify that commit, including
 suffixed branches such as `wheel/wip/<KEY>-2`. For old state without WIP
 metadata, Wheel discovers the highest numbered surviving branch. A skipped

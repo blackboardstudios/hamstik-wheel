@@ -160,17 +160,24 @@ case "$1 $2" in
       shift
     done
     cat .git/candidates.json;;
-  'work context') if [ -f ".git/context-$3.json" ]; then cat ".git/context-$3.json"; else printf '{"item":{"key":"%s"},"links":{"items":[],"page":{"hasMore":false}}}\n' "$3"; fi;;
-  'work start') echo "$3" >> .git/starts; echo in_progress > ".git/status-$3"; echo '{}';;
+  'work context')
+    if [ -f .git/claim-race ] && [ -f .git/status-read ]; then echo in_progress > ".git/status-$3"; fi
+    if [ -f ".git/context-$3.json" ]; then cat ".git/context-$3.json"; else printf '{"item":{"key":"%s"},"links":{"items":[],"page":{"hasMore":false}}}\n' "$3"; fi;;
+  'work start')
+    echo "$3" >> .git/starts; echo in_progress > ".git/status-$3"
+    if [ -f .git/start-lost-response ]; then echo 'response lost' >&2; exit 8; fi
+    echo '{}';;
   'work view')
     if [ -f .git/view-fails ] && [ -f .git/starts ]; then echo 'status unavailable' >&2; exit 8; fi
     if [ -f .git/view-malformed ] && [ -f .git/starts ]; then echo '{}'; exit 0; fi
     if [ -f ".git/status-$3" ]; then status=$(cat ".git/status-$3"); else status=todo; fi
+    touch .git/status-read
     printf '{"status":"%s"}\n' "$status";;
   'work transition')
     echo "$3 $4" >> .git/transitions
     if [ -f .git/transition-fails ]; then echo 'transition unavailable' >&2; exit 8; fi
     if [ ! -f .git/transition-noop ]; then echo "$4" > ".git/status-$3"; fi
+    if [ -f .git/transition-lost-response ]; then echo 'response lost' >&2; exit 8; fi
     echo '{}';;
   'work close')
     if [ "$TEST_MODE" = 'close-fails' ]; then echo 'close unavailable' >&2; exit 1; fi
@@ -358,6 +365,7 @@ fn skip_advances_and_cooldown_does_not_hide_other_candidates() {
     );
     // A fresh invocation still considers the second item despite TEST-1's cooldown.
     f.write(".git/starts", "");
+    f.write(".git/status-TEST-2", "todo\n"); // explicitly reopened for another attempt
     let output = f.run(&["once"], "skip");
     assert!(output.status.success());
     assert_eq!(f.read(".git/starts"), "TEST-2\n");
@@ -586,6 +594,7 @@ fn skipped_and_cooling_sprint_items_allow_project_fallback() {
     assert_eq!(f.read(".git/closes"), "TEST-2\n");
     assert!(String::from_utf8_lossy(&output.stdout).contains("No eligible active-sprint work"));
     f.write(".git/starts", "");
+    f.write(".git/status-TEST-2", "todo\n"); // explicitly reopened for another attempt
     assert!(f.run(&["once"], "skip").status.success());
     assert_eq!(f.read(".git/starts"), "TEST-2\n");
 }
@@ -630,6 +639,7 @@ fn failed_skip_restoration_retains_checkpoint_and_recovers_without_models() {
     for failure in [
         "transition-fails",
         "transition-noop",
+        "transition-lost-response",
         "view-fails",
         "view-malformed",
     ] {
@@ -723,6 +733,92 @@ fn legacy_checkpoint_does_not_guess_previous_status_and_preserves_manual_transit
     assert_eq!(f.state()["phase"], "idle");
     assert_eq!(f.read(".git/status-TEST-1").trim(), "backlog");
     assert_eq!(f.read(".git/transitions"), "");
+}
+
+#[test]
+fn failed_resume_preflight_releases_an_interrupted_claim_before_returning() {
+    let f = Fixture::new();
+    assert!(!f.run(&["once"], "rate-limit").status.success());
+    // Simulate a process dying during review with a durable pre-claim status.
+    let mut state = f.state();
+    state["current"]["needsReclaim"] = json!(false);
+    state["current"]["claimAttempted"] = json!(true);
+    state["current"]["claimConfirmed"] = json!(true);
+    state["lastError"] = Value::Null;
+    f.set_state(&state);
+    f.write(".git/status-TEST-1", "in_progress\n");
+    let output = f.run(&["resume"], "model-404");
+    assert!(!output.status.success());
+    assert_eq!(f.read(".git/status-TEST-1").trim(), "todo");
+    assert_eq!(f.state()["current"]["needsReclaim"], true);
+    assert_eq!(f.state()["phase"], "reviewing");
+    assert!(f.root().join("TEST-1.txt").exists());
+}
+
+#[test]
+fn skip_does_not_overwrite_a_status_changed_by_someone_else() {
+    let f = Fixture::new();
+    f.write(".git/status-during-implementation", "done\n");
+    assert!(f.run(&["once"], "skip").status.success());
+    assert_eq!(f.read(".git/status-TEST-1").trim(), "done");
+    assert!(!f.root().join(".git/transitions").exists());
+    assert_eq!(f.state()["phase"], "idle");
+}
+
+#[test]
+fn concurrent_claim_is_not_adopted_or_released_by_wheel() {
+    let f = Fixture::new();
+    f.write(".git/claim-race", "race");
+    let output = f.run(&["once"], "success");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ownership is unknown"));
+    assert!(!f.root().join(".git/starts").exists());
+    assert!(!f.root().join(".git/sessions").exists());
+    assert!(!f.root().join(".git/transitions").exists());
+    assert_eq!(f.read(".git/status-TEST-1").trim(), "in_progress");
+    assert_eq!(f.state()["current"]["claimAttempted"], false);
+}
+
+#[test]
+fn ambiguous_start_response_retains_cleanup_without_releasing_an_unproven_claim() {
+    let f = Fixture::new();
+    f.write(".git/start-lost-response", "fail");
+    f.write(".git/status-TEST-1", "backlog\n");
+    assert!(!f.run(&["once"], "success").status.success());
+    assert_eq!(f.read(".git/status-TEST-1").trim(), "in_progress");
+    assert_eq!(f.state()["phase"], "skipping");
+    assert_eq!(f.state()["current"]["claimAttempted"], true);
+    assert_eq!(f.state()["current"]["claimConfirmed"], false);
+    assert!(!f.root().join(".git/transitions").exists());
+    assert!(!f.root().join(".git/sessions").exists());
+    f.write(".git/status-TEST-1", "backlog\n");
+    assert!(f.run(&["resume"], "model-404").status.success());
+    assert_eq!(f.state()["phase"], "idle");
+}
+
+#[test]
+fn legacy_pause_does_not_adopt_done_as_a_status_to_reclaim() {
+    let f = Fixture::new();
+    assert!(!f.run(&["once"], "rate-limit").status.success());
+    let mut state = f.state();
+    state["current"]
+        .as_object_mut()
+        .unwrap()
+        .remove("previousStatus");
+    state["current"]["needsReclaim"] = json!(false);
+    f.set_state(&state);
+    f.write(".git/status-TEST-1", "done\n");
+    assert!(!f.run(&["resume"], "model-404").status.success());
+    assert!(f.state()["current"]["previousStatus"].is_null());
+    let output = f.run(&["resume"], "success");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(f.read(".git/starts"), "TEST-1\n");
+    assert_eq!(f.read(".git/status-TEST-1").trim(), "done");
+    assert!(!f.root().join(".git/closes").exists());
 }
 
 #[test]

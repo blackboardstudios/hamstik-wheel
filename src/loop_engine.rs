@@ -473,12 +473,17 @@ impl LoopEngine {
         let status = self.restore_status(&current)
             .context("claim release pending; checkpoint retained; run `hamstik-wheel resume` to retry cleanup")?;
         let active = state.current.as_mut().unwrap();
-        if active.previous_status.is_none() {
+        if active.previous_status.is_none()
+            && self.config.hamstik.statuses.contains(&status)
+            && !is_terminal(&status)
+        {
             // A legacy claim already released externally can safely establish
             // this status as the starting point for a future new claim.
             active.previous_status = Some(status.clone());
         }
         active.release_pending = false;
+        active.claim_attempted = false;
+        active.claim_confirmed = false;
         active.needs_reclaim = true;
         self.store.save(state)?;
         self.record_progress(
@@ -503,6 +508,9 @@ impl LoopEngine {
         let target = current.previous_status.as_deref().context(
             "legacy checkpoint has no previous status; restore the Work Item to its intended status manually, then resume cleanup",
         )?;
+        if !current.claim_confirmed {
+            bail!("{} is in progress without a confirmed Wheel claim; ownership is unknown, restore its intended status manually before resuming cleanup", current.key);
+        }
         if is_in_progress(target) {
             bail!(
                 "cannot release {} to an in-progress status; restore its intended status manually",
@@ -521,17 +529,26 @@ impl LoopEngine {
         Ok(actual)
     }
 
-    fn claim_status(&self, current: &ActiveWorkItem) -> Result<()> {
+    fn claim_status(&self, state: &mut WheelState) -> Result<()> {
+        let current = state.current.as_ref().unwrap().clone();
         let status = self.hamstik.item_status(&current.key)?;
         if is_in_progress(&status) {
-            // A prior claim request may have succeeded before a crash or a
-            // lost response. The pre-claim status remains durable.
-            return Ok(());
+            if current.claim_confirmed {
+                return Ok(());
+            }
+            bail!(
+                "{} is in progress without a confirmed Wheel claim (attempt recorded: {}); refusing to take over",
+                current.key, current.claim_attempted
+            );
         }
-        if current.previous_status.as_deref() != Some(status.as_str()) {
+        if is_terminal(&status) || current.previous_status.as_deref() != Some(status.as_str()) {
             bail!("{} status changed to `{status}` since the checkpoint; refusing to reclaim automatically", current.key);
         }
+        state.current.as_mut().unwrap().claim_attempted = true;
+        self.store.save(state)?;
         self.hamstik.start(&current.key)?;
+        state.current.as_mut().unwrap().claim_confirmed = true;
+        self.store.save(state)?;
         if !is_in_progress(&self.hamstik.item_status(&current.key)?) {
             bail!("claim of {} did not confirm in_progress", current.key);
         }
@@ -568,6 +585,8 @@ impl LoopEngine {
                 commit_sha: None,
                 validation_command_count: 0,
                 previous_status: None,
+                claim_attempted: false,
+                claim_confirmed: false,
                 release_pending: false,
                 needs_reclaim: false,
             });
@@ -859,8 +878,7 @@ impl LoopEngine {
             .as_ref()
             .is_some_and(|item| item.needs_reclaim)
         {
-            let current = state.current.as_ref().unwrap().clone();
-            self.claim_status(&current)?;
+            self.claim_status(state)?;
             let active = state.current.as_mut().unwrap();
             active.needs_reclaim = false;
             state.last_error = None;
@@ -887,7 +905,7 @@ impl LoopEngine {
                 );
             }
             self.logger.info(&format!("[claim] {}", current.key));
-            self.claim_status(&current)?;
+            self.claim_status(state)?;
             self.record_progress(
                 Kind::Started,
                 &current.key,
@@ -1483,6 +1501,13 @@ fn is_in_progress(status: &str) -> bool {
             .replace(['-', ' '], "_")
             .as_str(),
         "in_progress" | "inprogress"
+    )
+}
+
+fn is_terminal(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "done" | "canceled" | "cancelled"
     )
 }
 

@@ -41,6 +41,13 @@ pub struct ActiveWorkItem {
     /// Saved before the first claim. None on checkpoints from older versions.
     #[serde(default)]
     pub previous_status: Option<String>,
+    /// Persisted immediately before start; distinguishes our ambiguous claim
+    /// from another actor claiming an item we merely selected.
+    #[serde(default)]
+    pub claim_attempted: bool,
+    /// A start request returned success. Intent alone is not ownership proof.
+    #[serde(default)]
+    pub claim_confirmed: bool,
     /// Durable intent: retry releasing the remote claim before doing more work.
     #[serde(default)]
     pub release_pending: bool,
@@ -219,6 +226,8 @@ mod tests {
             commit_sha: None,
             validation_command_count: 0,
             previous_status: None,
+            claim_attempted: false,
+            claim_confirmed: false,
             release_pending: false,
             needs_reclaim: false,
         })
