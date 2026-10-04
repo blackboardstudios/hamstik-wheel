@@ -6,11 +6,15 @@ use std::{
     io::Write,
     path::Path,
     process::{Command, Stdio},
+    sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::{config::HamstikConfig, logging::Logger};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkItemSummary {
@@ -27,75 +31,104 @@ pub struct ActiveSprint {
     pub name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HamstikCli {
     repo_root: std::path::PathBuf,
     cli_path: std::path::PathBuf,
+    rate_limit_retries: usize,
+    rate_limit_retry_delay_seconds: u64,
+    logger: Arc<Logger>,
 }
 
 impl HamstikCli {
-    pub fn new(repo_root: &Path, cli_path: &str) -> Self {
+    pub fn new(repo_root: &Path, config: &HamstikConfig, logger: Arc<Logger>) -> Self {
         Self {
             repo_root: repo_root.to_path_buf(),
-            cli_path: std::path::PathBuf::from(cli_path),
+            cli_path: std::path::PathBuf::from(&config.cli_path),
+            rate_limit_retries: config.rate_limit_retries,
+            rate_limit_retry_delay_seconds: config.rate_limit_retry_delay_seconds,
+            logger,
         }
     }
 
     fn run_json(&self, args: &[&str]) -> Result<Value> {
-        let mut cmd = Command::new(&self.cli_path);
-        cmd.current_dir(&self.repo_root)
-            .args(["--no-input", "--json"])
-            .args(args);
-        let output = cmd.output().with_context(|| {
-            format!(
-                "failed to execute {} {}",
-                self.cli_path.display(),
-                args.join(" ")
-            )
-        })?;
-
-        if !output.status.success() {
-            bail!(
-                "{} {} failed (exit {:?}): {}",
-                self.cli_path.display(),
-                args.join(" "),
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-
-        serde_json::from_slice(&output.stdout).with_context(|| {
-            format!(
-                "{} {} did not return valid JSON",
-                self.cli_path.display(),
-                args.join(" ")
-            )
-        })
+        self.with_rate_limit_retries(args, |_| self.execute_json(args, None))
     }
 
     fn run_json_owned(&self, args: &[String]) -> Result<Value> {
-        let mut cmd = Command::new(&self.cli_path);
-        cmd.current_dir(&self.repo_root)
+        let args: Vec<_> = args.iter().map(String::as_str).collect();
+        self.run_json(&args)
+    }
+
+    fn with_rate_limit_retries(
+        &self,
+        args: &[&str],
+        mut attempt: impl FnMut(usize) -> Result<Value>,
+    ) -> Result<Value> {
+        for retry in 0..=self.rate_limit_retries {
+            match attempt(retry) {
+                Err(error)
+                    if error.downcast_ref::<HamstikRateLimit>().is_some()
+                        && retry < self.rate_limit_retries =>
+                {
+                    let delay = rate_limit_delay(self.rate_limit_retry_delay_seconds, retry);
+                    self.logger.warn(&format!(
+                        "[retry] hamstik {}: rate limited; retry {}/{} in {delay}s",
+                        args.join(" "),
+                        retry + 1,
+                        self.rate_limit_retries,
+                    ));
+                    std::thread::sleep(Duration::from_secs(delay));
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the last attempt always returns")
+    }
+
+    /// Replay only confirmed rate-limit rejections, never ambiguous transport failures.
+    fn execute_json(&self, args: &[&str], input: Option<&str>) -> Result<Value> {
+        let mut command = Command::new(&self.cli_path);
+        command
+            .current_dir(&self.repo_root)
             .args(["--no-input", "--json"])
             .args(args);
-        let output = cmd.output().with_context(|| {
-            format!(
-                "failed to execute {} {}",
-                self.cli_path.display(),
-                args.join(" ")
-            )
-        })?;
-
+        let output = if let Some(body) = input {
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .context("failed to execute hamstik comment command")?;
+            child
+                .stdin
+                .as_mut()
+                .context("failed to open hamstik stdin")?
+                .write_all(body.as_bytes())?;
+            drop(child.stdin.take());
+            child.wait_with_output()?
+        } else {
+            command.output().with_context(|| {
+                format!(
+                    "failed to execute {} {}",
+                    self.cli_path.display(),
+                    args.join(" ")
+                )
+            })?
+        };
         if !output.status.success() {
-            bail!(
+            let message = format!(
                 "{} {} failed (exit {:?}): {}",
                 self.cli_path.display(),
                 args.join(" "),
                 output.status.code(),
                 String::from_utf8_lossy(&output.stderr).trim()
             );
+            if is_rate_limited(output.status.code(), &output.stderr, &output.stdout) {
+                return Err(HamstikRateLimit(message).into());
+            }
+            bail!("{message}");
         }
-
         serde_json::from_slice(&output.stdout).with_context(|| {
             format!(
                 "{} {} did not return valid JSON",
@@ -235,8 +268,14 @@ impl HamstikCli {
         ])
     }
 
-    pub fn start(&self, key: &str) -> Result<Value> {
-        self.run_json(&["work", "start", key])
+    pub fn start(&self, key: &str, previous_status: &str) -> Result<Value> {
+        let args = ["work", "start", key];
+        self.with_rate_limit_retries(&args, |retry| {
+            if retry > 0 && self.item_status(key)? != previous_status {
+                bail!("{key} status changed while waiting for a rate limit; refusing to claim another actor's work");
+            }
+            self.execute_json(&args, None)
+        })
     }
 
     pub fn assign_to_me(&self, key: &str) -> Result<Value> {
@@ -260,7 +299,17 @@ impl HamstikCli {
     /// Transition an item to an arbitrary allowed target status (e.g. `todo`
     /// when a skipped item should return to the eligible pool).
     pub fn transition(&self, key: &str, target: &str) -> Result<Value> {
-        self.run_json(&["work", "transition", key, target])
+        let args = ["work", "transition", key, target];
+        self.with_rate_limit_retries(&args, |retry| {
+            if retry > 0 {
+                let status = self.item_status(key)?;
+                if status == target { return Ok(Value::Null); }
+                if normalize(&status) != "in_progress" {
+                    bail!("{key} status changed while waiting for a rate limit; refusing to overwrite `{status}`");
+                }
+            }
+            self.execute_json(&args, None)
+        })
     }
 
     pub fn add_comment(
@@ -269,45 +318,39 @@ impl HamstikCli {
         body: &str,
         idempotency_key: Option<&str>,
     ) -> Result<Value> {
-        let mut command = Command::new(&self.cli_path);
-        command.current_dir(&self.repo_root).args([
-            "--no-input",
-            "--json",
-            "work",
-            "comment",
-            "add",
-            key,
-            "--body-file",
-            "-",
-        ]);
+        let mut args = vec!["work", "comment", "add", key, "--body-file", "-"];
         if let Some(value) = idempotency_key {
-            command.args(["--idempotency-key", value]);
+            args.extend(["--idempotency-key", value]);
         }
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("failed to execute hamstik work comment add")?;
-
-        child
-            .stdin
-            .as_mut()
-            .context("failed to open hamstik stdin")?
-            .write_all(body.as_bytes())?;
-        drop(child.stdin.take());
-        let output = child.wait_with_output()?;
-        if !output.status.success() {
-            bail!(
-                "hamstik work comment add {} failed (exit {:?}): {}",
-                key,
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        serde_json::from_slice(&output.stdout)
-            .context("hamstik comment command did not return valid JSON")
+        self.with_rate_limit_retries(&args, |_| self.execute_json(&args, Some(body)))
     }
+}
+
+/// Distinct from item failures so exhausted throttling never triggers skip cleanup.
+#[derive(Debug)]
+pub struct HamstikRateLimit(String);
+
+impl std::fmt::Display for HamstikRateLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Hamstik API rate limited: {}", self.0)
+    }
+}
+impl std::error::Error for HamstikRateLimit {}
+
+fn is_rate_limited(exit_code: Option<i32>, stderr: &[u8], stdout: &[u8]) -> bool {
+    // Exit 7 is the official CLI's stable RATE_LIMITED exit contract. Prefer
+    // structured fields to text matching: a message mentioning 429 isn't proof.
+    exit_code == Some(7)
+        || [stderr, stdout].iter().any(|bytes| {
+            serde_json::from_slice::<Value>(bytes).is_ok_and(|value| {
+                value.pointer("/error/code").and_then(Value::as_str) == Some("RATE_LIMITED")
+                    || value.pointer("/error/status").and_then(Value::as_u64) == Some(429)
+            })
+        })
+}
+
+fn rate_limit_delay(initial: u64, retry: usize) -> u64 {
+    initial.saturating_mul(1u64 << retry.min(10)).min(300)
 }
 
 fn assign_to_me_args(key: &str) -> Vec<String> {
@@ -471,6 +514,37 @@ fn named_value(value: Option<&Value>) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn recognizes_only_confirmed_rate_limits() {
+        assert!(is_rate_limited(Some(7), b"", b""));
+        assert!(is_rate_limited(
+            Some(1),
+            br#"{"error":{"status":429}}"#,
+            b""
+        ));
+        assert!(is_rate_limited(
+            Some(1),
+            b"",
+            br#"{"error":{"code":"RATE_LIMITED"}}"#
+        ));
+        assert!(!is_rate_limited(
+            Some(4),
+            br#"{"error":{"status":403,"message":"429 mentioned in documentation"}}"#,
+            b""
+        ));
+        assert!(!is_rate_limited(Some(8), b"connection lost", b""));
+    }
+
+    #[test]
+    fn rate_limit_backoff_is_bounded_and_overflow_safe() {
+        assert_eq!(
+            (0..5).map(|n| rate_limit_delay(30, n)).collect::<Vec<_>>(),
+            vec![30, 60, 120, 240, 300]
+        );
+        assert_eq!(rate_limit_delay(u64::MAX, 10), 300);
+        assert_eq!(rate_limit_delay(0, 0), 0);
+    }
 
     #[test]
     fn only_unarchived_active_sprints_are_preferred() {

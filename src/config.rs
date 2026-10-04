@@ -39,6 +39,10 @@ pub struct HamstikConfig {
     pub label_names: Vec<String>,
     /// Assign each claimed Work Item to the authenticated Hamstik user.
     pub assign_to_me: bool,
+    /// Additional CLI attempts after a confirmed Hamstik API rate limit.
+    pub rate_limit_retries: usize,
+    /// Initial delay; doubles per retry, capped at five minutes.
+    pub rate_limit_retry_delay_seconds: u64,
 }
 
 impl Default for HamstikConfig {
@@ -54,6 +58,8 @@ impl Default for HamstikConfig {
             ],
             label_names: Vec::new(),
             assign_to_me: true,
+            rate_limit_retries: 3,
+            rate_limit_retry_delay_seconds: 30,
         }
     }
 }
@@ -269,6 +275,9 @@ impl Config {
         if self.r#loop.provider_retries > 10 {
             bail!("[loop].provider_retries must be at most 10");
         }
+        if self.hamstik.rate_limit_retries > 10 {
+            bail!("[hamstik].rate_limit_retries must be at most 10");
+        }
         for rule in &self.validation.rules {
             if rule.path_prefixes.is_empty() || rule.commands.is_empty() {
                 bail!("validation rules require path_prefixes and commands");
@@ -362,6 +371,7 @@ commands = ["precheck", "migration-test", "postgres-test"]
             "[[validation.rules]]\npath_prefixes = ['../drizzle']\ncommands = ['test']",
             "[[validation.rules]]\npath_prefixes = ['drizzle/']\ncommands = ['']",
             "[loop]\nprovider_retries = 11",
+            "[hamstik]\nrate_limit_retries = 11",
         ] {
             assert!(toml::from_str::<Config>(raw).unwrap().validate().is_err());
         }

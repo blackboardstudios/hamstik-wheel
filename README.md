@@ -317,6 +317,9 @@ item_types = ["task", "bug", "story", "feature"]
 label_names = []
 # Assign each claimed Work Item to the authenticated Hamstik user.
 assign_to_me = true
+# Retry confirmed Hamstik API rate limits independently of model-provider retries.
+rate_limit_retries = 3
+rate_limit_retry_delay_seconds = 30
 
 [models]
 # Any model identifier Pi can resolve is valid.
@@ -633,6 +636,26 @@ and working tree while restoring the pre-claim remote status. Restore provider
 access or change the configured model, then run `hamstik-wheel resume`: Wheel
 reclaims the item, and a failed reviewer resumes review without
 repeating implementation or consuming another review cycle.
+
+Hamstik API throttling (`RATE_LIMITED`, HTTP 429, or CLI exit 7) is also
+separate from item failures. Wheel retries the rejected CLI operation up to
+`[hamstik].rate_limit_retries` additional times (default 3, maximum 10), waiting
+`rate_limit_retry_delay_seconds` initially (default 30), then doubling the delay
+up to 300 seconds. These retries happen after the CLI's own internal retries;
+the CLI currently does not expose the server's Retry-After header in its JSON
+error envelope. Selection, claims, assignment, closing, status cleanup, and
+advisory comments share this handling. Comment retries keep the same body and
+idempotency key. Authentication, permission, and ambiguous network failures
+are not retried by this policy.
+
+Exhausted rate limits on required operations stop the run, even with
+`on_failure = "skip"`. The active phase and local work remain available for
+`hamstik-wheel resume`, and Wheel attempts to restore its confirmed claim's
+previous status. If cleanup is also throttled, `releasePending` stays durable
+and must finish before further work. A resumed close does not repeat
+implementation or create another commit. While retrying a claim, Wheel
+rechecks the pre-claim status so it cannot adopt another actor's claim during
+the delay. Existing skip history is not retroactively reclassified.
 
 Implementation process/protocol errors get one additional session when
 `implement_retry = true`; review process/protocol errors always get one.

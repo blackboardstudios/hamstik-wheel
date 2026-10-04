@@ -40,7 +40,11 @@ Wheel will not:
 - call `/api/v1` endpoints itself;
 - inspect Hamstik database/internal application state.
 
-Wheel will prefer Hamstik CLI `--json` and `--no-input` surfaces and will stop on non-zero CLI status rather than attempt to repair authentication/API failures itself.
+Wheel will prefer Hamstik CLI `--json` and `--no-input` surfaces. Confirmed
+rate-limit rejections may replay the same CLI operation with bounded backoff,
+after the CLI's internal retries. Exhaustion stops with resumable state rather
+than an item skip. Other non-zero statuses are not automatically replayed;
+Wheel does not attempt to repair authentication or ambiguous network failures.
 
 ## Consequences
 

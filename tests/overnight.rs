@@ -55,6 +55,8 @@ impl Fixture {
             r#"
 [hamstik]
 cli_path = ".git/bin/hamstik"
+rate_limit_retries = 2
+rate_limit_retry_delay_seconds = 0
 [models]
 implement = "implement"
 review = "review"
@@ -145,6 +147,20 @@ const HAMSTIK: &str = r#"#!/bin/sh
 if [ "$1" = '--version' ]; then echo test; exit 0; fi
 shift 2
 echo "$*" >> .git/hamstik-commands
+if [ -f .git/rate-limit-operation ] && [ "$1 $2" = "$(cat .git/rate-limit-operation)" ]; then
+  echo "$*" >> .git/rate-limit-attempts
+  attempt=$(wc -l < .git/rate-limit-attempts)
+  if [ "$1 $2" = 'work comment' ]; then cat > ".git/comment-body-$attempt"; fi
+  remaining=$(cat .git/rate-limit-remaining)
+  if [ "$remaining" -gt 0 ]; then
+    echo "$((remaining - 1))" > .git/rate-limit-remaining
+    if [ -f .git/rate-limit-claim-race ]; then echo in_progress > ".git/status-$3"; fi
+    if [ -f .git/forbidden-instead ]; then
+      echo '{"error":{"code":"FORBIDDEN","status":403,"message":"not allowed"}}' >&2; exit 4
+    fi
+    echo '{"error":{"code":"RATE_LIMITED","kind":"api","status":429,"message":"Too many requests."}}' >&2; exit 7
+  fi
+fi
 case "$1 $2" in
   'commands ') cat .git/manifest.json;;
   'sprint list')
@@ -970,4 +986,140 @@ fn validation_defaults_to_isolation_even_for_agent_editable_scripts() {
         String::from_utf8_lossy(&result.stdout)
     );
     assert_eq!(fs::read_to_string(sentinel).unwrap(), "original");
+}
+
+#[test]
+fn hamstik_rate_limits_retry_start_selection_and_close_without_skipping() {
+    for operation in [
+        "sprint list",
+        "work list",
+        "work context",
+        "work start",
+        "work edit",
+        "work close",
+    ] {
+        let f = Fixture::new();
+        f.write(".git/rate-limit-operation", operation);
+        f.write(".git/rate-limit-remaining", "2");
+        let output = f.run(&["once"], "success");
+        assert!(
+            output.status.success(),
+            "{operation}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("rate limited; retry 2/2 in 0s"));
+        assert_eq!(f.read(".git/closes"), "TEST-1\n");
+        assert_eq!(f.state()["skipLedger"], json!([]));
+        assert_eq!(f.read(".git/sessions"), "implement\nreview\n");
+    }
+}
+
+#[test]
+fn exhausted_hamstik_rate_limits_pause_and_resume_the_same_phase() {
+    for operation in ["work start", "work edit", "work close"] {
+        let f = Fixture::new();
+        f.write(".git/rate-limit-operation", operation);
+        f.write(".git/rate-limit-remaining", "99");
+        let output = f.run(&["run", "--max-items", "2"], "success");
+        assert!(!output.status.success(), "{operation}");
+        assert_eq!(f.read(".git/rate-limit-attempts").lines().count(), 3);
+        let phase = if operation == "work close" {
+            "closing"
+        } else {
+            "selected"
+        };
+        assert_eq!(f.state()["phase"], phase);
+        assert_eq!(f.state()["current"]["key"], "TEST-1");
+        assert_eq!(f.state()["current"]["needsReclaim"], true);
+        assert_eq!(f.state()["skipLedger"], json!([]));
+        assert!(!f.root().join("TEST-2.txt").exists());
+        if operation != "work start" {
+            assert_eq!(f.read(".git/status-TEST-1").trim(), "todo");
+        }
+        let head = f.git(&["rev-parse", "HEAD"]);
+        let report = f.run(&["--no-timestamps", "progress-report"], "success");
+        assert!(String::from_utf8_lossy(&report.stdout).contains("Paused TEST-1"));
+        f.write(".git/rate-limit-remaining", "0");
+        let output = f.run(&["resume"], "success");
+        assert!(
+            output.status.success(),
+            "{operation}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(f.read(".git/sessions"), "implement\nreview\n");
+        assert_eq!(f.read(".git/closes"), "TEST-1\n");
+        assert_eq!(f.state()["phase"], "idle");
+        if operation == "work close" {
+            assert_eq!(f.git(&["rev-parse", "HEAD"]), head);
+        }
+    }
+}
+
+#[test]
+fn throttled_status_cleanup_remains_pending_and_resumes_before_new_work() {
+    let f = Fixture::new();
+    f.write(".git/rate-limit-operation", "work transition");
+    f.write(".git/rate-limit-remaining", "99");
+    assert!(!f.run(&["once"], "rate-limit").status.success());
+    assert_eq!(f.state()["phase"], "reviewing");
+    assert_eq!(f.state()["current"]["releasePending"], true);
+    assert_eq!(f.state()["skipLedger"], json!([]));
+    assert_eq!(f.read(".git/status-TEST-1").trim(), "in_progress");
+    f.write(".git/rate-limit-remaining", "0");
+    assert!(f.run(&["resume"], "success").status.success());
+    assert_eq!(f.read(".git/transitions"), "TEST-1 todo\n");
+    assert_eq!(f.read(".git/sessions").matches("implement").count(), 1);
+    assert_eq!(f.read(".git/closes"), "TEST-1\n");
+}
+
+#[test]
+fn rate_limit_wait_does_not_adopt_a_concurrent_claim() {
+    let f = Fixture::new();
+    f.write(".git/rate-limit-operation", "work start");
+    f.write(".git/rate-limit-remaining", "1");
+    f.write(".git/rate-limit-claim-race", "yes");
+    assert!(!f.run(&["once"], "success").status.success());
+    assert_eq!(f.read(".git/rate-limit-attempts").lines().count(), 1);
+    assert_eq!(f.state()["current"]["claimConfirmed"], false);
+    assert!(!f.root().join(".git/starts").exists());
+    assert!(!f.root().join(".git/transitions").exists());
+    assert!(!f.root().join(".git/sessions").exists());
+}
+
+#[test]
+fn hamstik_permission_failures_are_not_retried_as_rate_limits() {
+    let f = Fixture::new();
+    f.write(".git/rate-limit-operation", "work start");
+    f.write(".git/rate-limit-remaining", "99");
+    f.write(".git/forbidden-instead", "yes");
+    f.run(&["once"], "success");
+    assert_eq!(f.read(".git/rate-limit-attempts").lines().count(), 1);
+}
+
+#[test]
+fn comment_retry_replays_the_body_and_idempotency_key() {
+    let f = Fixture::new();
+    let config = f
+        .read(".hamstik-wheel.toml")
+        .replace("post_started = false", "post_started = true");
+    f.write(".hamstik-wheel.toml", &config);
+    f.git(&["add", "-A"]);
+    f.git(&["commit", "-qm", "enable comments"]);
+    f.write(".git/rate-limit-operation", "work comment");
+    f.write(".git/rate-limit-remaining", "1");
+    let output = f.run(&["once"], "success");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let attempts = f.read(".git/rate-limit-attempts");
+    let attempts: Vec<_> = attempts.lines().collect();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0], attempts[1]);
+    assert!(attempts[0].contains("--idempotency-key"));
+    assert_eq!(f.read(".git/comment-body-1"), f.read(".git/comment-body-2"));
+    assert!(f
+        .read(".git/comment-body-1")
+        .contains("started automated implementation"));
 }

@@ -7,6 +7,7 @@ use std::{
     io::Write,
     path::PathBuf,
     process::{Command, Stdio},
+    sync::Arc,
 };
 
 use anyhow::{bail, Context, Result};
@@ -14,7 +15,9 @@ use anyhow::{bail, Context, Result};
 use crate::{
     config::{self, Config},
     git::GitRepo,
-    hamstik::{select_next, unresolved_dependencies, HamstikCli, WorkItemSummary},
+    hamstik::{
+        select_next, unresolved_dependencies, HamstikCli, HamstikRateLimit, WorkItemSummary,
+    },
     logging::Logger,
     pi::{implementation_prompt, provider_failure, review_prompt, PiRunner, ProviderFailure},
     progress::{self, Event, Kind},
@@ -29,7 +32,7 @@ pub struct LoopEngine {
     pi: PiRunner,
     store: StateStore,
     logs_root: PathBuf,
-    logger: Logger,
+    logger: Arc<Logger>,
 }
 
 impl LoopEngine {
@@ -56,7 +59,12 @@ impl LoopEngine {
     pub fn load_with_logger(logger: &Logger) -> Result<Self> {
         let repo = GitRepo::discover()?;
         let config = Config::load(repo.root())?;
-        let hamstik = HamstikCli::new(repo.root(), &config.hamstik.cli_path);
+        let logger = Arc::new(Logger::new(
+            logger.timestamps(),
+            logger.log_file_path().as_deref(),
+            logger.verbose(),
+        )?);
+        let hamstik = HamstikCli::new(repo.root(), &config.hamstik, Arc::clone(&logger));
         let pi = PiRunner::new(
             repo.root(),
             repo.metadata_path("hamstik-wheel/runtime")?,
@@ -71,11 +79,7 @@ impl LoopEngine {
             pi,
             store: StateStore::new(state_path),
             logs_root,
-            logger: Logger::new(
-                logger.timestamps(),
-                logger.log_file_path().as_deref(),
-                logger.verbose(),
-            )?,
+            logger,
         })
     }
 
@@ -546,7 +550,7 @@ impl LoopEngine {
         }
         state.current.as_mut().unwrap().claim_attempted = true;
         self.store.save(state)?;
-        self.hamstik.start(&current.key)?;
+        self.hamstik.start(&current.key, &status)?;
         state.current.as_mut().unwrap().claim_confirmed = true;
         self.store.save(state)?;
         if !is_in_progress(&self.hamstik.item_status(&current.key)?) {
@@ -603,6 +607,16 @@ impl LoopEngine {
             let _ = self.store.save(&mut state);
             if let Some(active) = &state.current {
                 self.record_progress(Kind::Failed, &active.key, &active.title, &error_text);
+            }
+
+            // Hamstik throttling is infrastructure availability, not failed work.
+            // Keep the phase/tree and release our claim before stopping; if that
+            // is also throttled, pause_active leaves durable cleanup intent.
+            if error.downcast_ref::<HamstikRateLimit>().is_some() {
+                self.pause_active(&mut state).context(
+                    "Hamstik API rate limit retries exhausted; checkpoint and pending status cleanup retained",
+                )?;
+                return Err(error.context("Hamstik API rate limit retries exhausted; active checkpoint preserved; run `hamstik-wheel resume` after the rate limit clears"));
             }
 
             // Provider availability affects every item using this model. Preserve

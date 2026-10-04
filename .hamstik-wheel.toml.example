@@ -5,6 +5,10 @@
 # Absolute or relative path to the Hamstik CLI binary.
 # Defaults to "hamstik" (resolved via PATH) when omitted.
 cli_path = "hamstik"
+# Additional CLI attempts after a confirmed API rate limit (0–10).
+rate_limit_retries = 3
+# Initial delay; doubles per retry, capped at 300 seconds.
+rate_limit_retry_delay_seconds = 30
 
 # Candidate discovery is scoped to the Organization/Project selected by Hamstik CLI.
 # Epics are excluded by default because Wheel should execute actionable child work.
