@@ -60,6 +60,7 @@ export default function (pi) {
     parameters: Type.Object({
       status: Type.Union(['ready_for_review', 'pass', 'blocked'].map(v => Type.Literal(v))),
       summary: Type.String(), findings: Type.Array(Type.String()), unverified_checks: Type.Array(Type.String()),
+      pending_scheduled_checks: Type.Array(Type.Object({ command: Type.String() })),
     }),
     async execute(_id, result) {
       if (finished) throw new Error('Wheel result already submitted');

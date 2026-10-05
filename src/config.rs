@@ -84,6 +84,9 @@ impl Default for ModelsConfig {
 #[serde(default)]
 pub struct ValidationConfig {
     pub execution: ValidationExecution,
+    /// Lightweight commands that prove the configured validation sandbox can
+    /// start before Wheel claims a Work Item. These are not test substitutes.
+    pub preflight_commands: Vec<String>,
     pub commands: Vec<String>,
     pub rules: Vec<ValidationRule>,
     /// Paths that must be covered by a specialized validation rule.
@@ -161,6 +164,8 @@ pub struct LoopConfig {
     pub max_items: usize,
     pub max_review_cycles: usize,
     pub on_failure: OnFailure,
+    /// Stop an unattended run after this many consecutive item skips.
+    pub max_consecutive_skips: usize,
     /// Wall-clock cap for each agent (implement/review) session, in minutes.
     /// Zero disables the cap.
     pub agent_timeout_minutes: u64,
@@ -180,6 +185,7 @@ impl Default for LoopConfig {
             max_items: 10,
             max_review_cycles: 3,
             on_failure: OnFailure::Halt,
+            max_consecutive_skips: 3,
             agent_timeout_minutes: 45,
             implement_retry: true,
             provider_retries: 3,
@@ -272,6 +278,9 @@ impl Config {
         if self.r#loop.max_review_cycles == 0 {
             bail!("[loop].max_review_cycles must be greater than zero");
         }
+        if self.r#loop.max_consecutive_skips == 0 {
+            bail!("[loop].max_consecutive_skips must be greater than zero");
+        }
         if self.r#loop.provider_retries > 10 {
             bail!("[loop].provider_retries must be at most 10");
         }
@@ -310,8 +319,9 @@ impl Config {
         }
         if self
             .validation
-            .commands
+            .preflight_commands
             .iter()
+            .chain(self.validation.commands.iter())
             .chain(self.validation.rules.iter().flat_map(|r| &r.commands))
             .any(|command| command.trim().is_empty())
         {
@@ -433,5 +443,11 @@ implement_retry = true
         let parsed: Config = toml::from_str("[loop]\nagent_timeout_minutes = 0\n").unwrap();
         parsed.validate().unwrap();
         assert_eq!(parsed.r#loop.agent_timeout_minutes, 0);
+    }
+
+    #[test]
+    fn rejects_zero_consecutive_skip_limit() {
+        let parsed: Config = toml::from_str("[loop]\nmax_consecutive_skips = 0\n").unwrap();
+        assert!(parsed.validate().is_err());
     }
 }

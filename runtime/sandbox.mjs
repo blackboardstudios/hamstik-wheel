@@ -6,15 +6,33 @@ import os from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 
 const sensitive = /^(\.env(?:\..*)?|\.ssh|\.aws|\.gnupg|\.npmrc|\.netrc|.*\.(?:pem|key|p12|pfx)|(?:secrets?|credentials?)(?:\..*)?)$/i;
+// Source modules and example environment templates are code, not credential stores.
+// Keep actual .env/config/key material masked, including inside dependencies.
+const sourceModule = /^(?:secrets?|credentials?)(?:\.[^.]+)*\.(?:[cm]?[jt]sx?|py|rs|go|java|rb|c|h|cpp|hpp)(?:\.map)?$/i;
+const envTemplate = /^\.env(?:\.[^.]+)*\.(?:example|sample|template)$/i;
+const isSensitive = name => sensitive.test(name) && !sourceModule.test(name) && !envTemplate.test(name);
 const protectedNames = new Set(['.git', '.pi', '.hamstik-wheel.toml', 'node_modules']);
 const inside = (root, target) => target === root || target.startsWith(root + path.sep);
+// Empty regular files remain parseable by dotenv/build tools. A bind of
+// /dev/null instead exposes a device node and can fail with EACCES/ENOENT.
+const maskFile = (args, target) => args.push('--ro-bind-data', String(3 + args.filter(arg => arg === '--ro-bind-data').length), target);
+function maskDescriptors(args) {
+  const descriptors = [];
+  try {
+    for (const arg of args) if (arg === '--ro-bind-data') descriptors.push(fs.openSync('/dev/null', 'r'));
+    return descriptors;
+  } catch (error) {
+    descriptors.forEach(fd => fs.closeSync(fd));
+    throw error;
+  }
+}
 
 export function guardPath(root, requested, mutation = false) {
   const target = path.resolve(root, requested);
   if (!inside(root, target)) throw new Error('Wheel denies paths outside the repository');
   let cursor = root;
   for (const part of path.relative(root, target).split(path.sep).filter(Boolean)) {
-    if (sensitive.test(part) || part === '.git' || part === '.pi' || (mutation && protectedNames.has(part))) {
+    if (isSensitive(part) || part === '.git' || part === '.pi' || (mutation && protectedNames.has(part))) {
       throw new Error('Wheel denies sensitive or protected paths');
     }
     cursor = path.join(cursor, part);
@@ -32,22 +50,35 @@ export function guardPath(root, requested, mutation = false) {
 // Collect mounts before executing untrusted shell code. Never follow symlinks.
 function protectTree(root, args, readOnly = false) {
   const hardlinks = new Map();
-  const walk = (dir, inheritedReadOnly) => {
+  const walk = (dir, inheritedReadOnly, dependencyOverlay = false) => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const p = path.join(dir, entry.name);
       if (entry.isSymbolicLink()) {
-        if (sensitive.test(entry.name)) throw new Error('Wheel refuses symlinked credential paths: ' + p);
+        if (isSensitive(entry.name)) throw new Error('Wheel refuses symlinked credential paths: ' + p);
         continue;
       }
-      if (sensitive.test(entry.name) || entry.name === '.pi' || (inheritedReadOnly && entry.name === 'hamstik-wheel')) {
-        args.push(...(entry.isDirectory() ? ['--tmpfs', p, '--remount-ro', p] : ['--ro-bind', '/dev/null', p]));
+      if (isSensitive(entry.name) || entry.name === '.pi' || (inheritedReadOnly && entry.name === 'hamstik-wheel')) {
+        if (entry.isDirectory()) args.push('--tmpfs', p, '--remount-ro', p);
+        else maskFile(args, p);
+      } else if (['.next', '.astro'].includes(entry.name) && entry.isDirectory() && !inheritedReadOnly) {
+        // Old build output can contain copied .env files. Hide the whole cache
+        // so clean builds can remove/recreate files without credential bind
+        // mounts causing EBUSY, and without exposing prior runtime configuration.
+        args.push('--tmpfs', p);
+      } else if (entry.name === 'node_modules' && entry.isDirectory() && !readOnly) {
+        // Writable copy-on-write dependencies let Vite/Astro create caches without
+        // changing host packages. Nested pnpm node_modules inherit this overlay.
+        if (!dependencyOverlay) args.push('--overlay-src', p, '--tmp-overlay', p);
+        walk(p, true, true);
       } else if (protectedNames.has(entry.name)) {
         args.push('--ro-bind', p, p);
-        if (entry.isDirectory()) walk(p, true);
+        if (entry.isDirectory()) walk(p, true, dependencyOverlay);
       } else if (entry.isDirectory()) {
-        walk(p, inheritedReadOnly);
+        walk(p, inheritedReadOnly, dependencyOverlay);
       } else if (!entry.isFile()) {
-        throw new Error('Wheel refuses repository sockets/devices/FIFOs: ' + p);
+        // Never expose host IPC, but keep unrelated tools usable after a task
+        // accidentally leaves a socket/FIFO behind. Direct file tools still deny it.
+        maskFile(args, p);
       } else {
         const stat = fs.statSync(p);
         if (!inheritedReadOnly && stat.nlink > 1) {
@@ -60,7 +91,7 @@ function protectTree(root, args, readOnly = false) {
   };
   walk(root, readOnly);
   for (const { count, paths } of hardlinks.values()) {
-    if (paths.length < count) for (const p of paths) args.push('--ro-bind', '/dev/null', p);
+    if (paths.length < count) for (const p of paths) maskFile(args, p);
   }
 }
 
@@ -75,6 +106,11 @@ export function sandboxArgs(config, command) {
     if (fs.existsSync(p)) args.push('--ro-bind', p, p);
   }
   args.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--dir', '/run', '--dir', '/etc');
+  // libc identity lookup is needed by initdb. These contain account names/IDs,
+  // not password hashes; /etc/shadow and every other host config remain hidden.
+  for (const p of ['/etc/passwd', '/etc/group', '/etc/hosts']) {
+    if (fs.existsSync(p)) args.push('--ro-bind', p, p);
+  }
   for (const p of config.readOnlyPaths ?? []) {
     const actual = fs.realpathSync(p);
     if (actual === '/' || actual === os.homedir() || /^\/home\/[^/]+$/.test(actual) || inside(root, actual) || ['/root', '/home', '/run', '/proc', '/dev', '/tmp', '/etc'].includes(actual) || inside(actual, root)) {
@@ -94,20 +130,30 @@ export function sandboxArgs(config, command) {
   }
   args.push('--dir', '/tmp/wheel-home', '--setenv', 'HOME', '/tmp/wheel-home', '--setenv', 'TMPDIR', '/tmp',
     '--setenv', 'PATH', (config.readOnlyPaths ?? []).flatMap(p => [path.join(p, 'bin'), p]).concat(['/usr/local/bin', '/usr/bin', '/bin']).join(':'),
-    '--setenv', 'LANG', 'C.UTF-8', '--setenv', 'GIT_CONFIG_NOSYSTEM', '1', '--setenv', 'GIT_CONFIG_GLOBAL', '/dev/null',
+    '--setenv', 'WHEEL_SANDBOX', '1', '--setenv', 'LANG', 'C.UTF-8', '--setenv', 'GIT_CONFIG_NOSYSTEM', '1', '--setenv', 'GIT_CONFIG_GLOBAL', '/dev/null',
     '--chdir', root, '--remount-ro', '/', '--', '/bin/bash', '--noprofile', '--norc', '-c', command);
   return args;
 }
 
 export function checkSandbox(config) {
-  const result = spawnSync('/usr/bin/bwrap', sandboxArgs(config, 'test -x /usr/bin/node && /usr/bin/node --version >/dev/null'), { encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL' });
+  const args = sandboxArgs(config, 'test -x /usr/bin/node && /usr/bin/node --version >/dev/null');
+  const descriptors = maskDescriptors(args);
+  let result;
+  try {
+    result = spawnSync('/usr/bin/bwrap', args, { encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe', ...descriptors] });
+  } finally { descriptors.forEach(fd => fs.closeSync(fd)); }
   if (result.error || result.status !== 0) throw new Error('Wheel sandbox unavailable: ' + (result.error?.message ?? result.stderr));
 }
 
 export function executeSandbox(config, command, options) {
   return new Promise((resolve, reject) => {
     if (options.signal?.aborted) return reject(new Error('Aborted'));
-    const child = spawn('/usr/bin/bwrap', sandboxArgs(config, command), { stdio: ['pipe', 'pipe', 'pipe'], env: {} });
+    const args = sandboxArgs(config, command);
+    const descriptors = maskDescriptors(args);
+    let child;
+    try {
+      child = spawn('/usr/bin/bwrap', args, { stdio: ['pipe', 'pipe', 'pipe', ...descriptors], env: {} });
+    } finally { descriptors.forEach(fd => fs.closeSync(fd)); }
     child.stdin.on('error', () => {});
     child.stdin.end(options.input ?? '');
     const abort = () => child.kill('SIGKILL');

@@ -32,6 +32,16 @@ pub struct AgentResult {
     /// never hide these behind a prose-only caveat.
     #[serde(default)]
     pub unverified_checks: Vec<String>,
+    /// Required checks that Wheel is configured to run. A declaration is not
+    /// evidence: the engine validates the exact command and runs it at both
+    /// validation gates.
+    #[serde(default)]
+    pub pending_scheduled_checks: Vec<PendingScheduledCheck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingScheduledCheck {
+    pub command: String,
 }
 
 #[derive(Debug)]
@@ -348,9 +358,9 @@ Your responsibilities:
 7. Do NOT change the Hamstik Work Item status, add Hamstik comments, or close the Work Item. Hamstik Wheel owns lifecycle.
 8. Do NOT create a Git commit. Leave the complete implementation in the working tree for independent review.
 9. If requirements are materially ambiguous/conflicting or safe completion is impossible, stop without inventing requirements.
-10. Identify validation required by repository instructions and the changed behavior (including populated database migrations and integration tests). Do not assume Wheel's generic prechecks include these. If a required check cannot run and is not explicitly scheduled in the Wheel validation commands supplied below, return blocked and list it in unverified_checks. Never hide unrun required checks in prose while returning ready_for_review.
+10. Identify validation required by repository instructions and the changed behavior (including populated database migrations and integration tests). Do not assume Wheel's generic prechecks include these. If a required check cannot run but its exact command is listed in WHEEL_VALIDATION_CONFIG and applies to the actual changed paths, declare it as `pending_scheduled_checks: [{{"command":"..."}}]`; an exact configured wrapper command is allowed when it invokes the required check(s). Wheel will run it before review and again at the final gate. All other required checks must return blocked and appear in unverified_checks. Never hide unrun required checks in prose while returning ready_for_review.
 
-Your final tool action MUST call wheel_result. Supply status ready_for_review or blocked, a concrete summary, findings, and unverified_checks (both arrays are required even when empty). Do not merely print a marker or verdict in prose. No editing or checks are possible after you submit the result.
+Your final tool action MUST call wheel_result. Supply status ready_for_review or blocked, a concrete summary, findings, unverified_checks, and pending_scheduled_checks (all arrays are required even when empty). Do not merely print a marker or verdict in prose. No editing or checks are possible after you submit the result.
 "#,
         serde_json::to_string_pretty(context).unwrap_or_else(|_| context.to_string())
     )
@@ -397,13 +407,13 @@ You are authorized to edit the working tree to fix every actionable finding. Aft
 
 Work within the session wall-clock limit:
 - Inspect `git diff {baseline}` first; read touched files and relevant dependencies.
-- Do NOT run full-repository verification: never run precheck scripts, `cargo fmt --all`, `cargo clippy --workspace`, `cargo build --workspace --release`, or the whole test suite. Hamstik Wheel runs the configured validation commands after implementation and again after your review. Do not treat a passing configured suite as evidence for checks it does not include. If a required check is absent from the supplied evidence and is not explicitly scheduled for final validation, return blocked with unverified_checks. Never return pass with required validation missing.
+- Do NOT run full-repository verification: never run precheck scripts, `cargo fmt --all`, `cargo clippy --workspace`, `cargo build --workspace --release`, or the whole test suite. Hamstik Wheel runs the configured validation commands after implementation and again after your review. Do not treat a passing configured suite as evidence for checks it does not include. A check explicitly declared in pending_scheduled_checks is scheduled evidence, not an unverified check; every other required check absent from supplied evidence must return blocked with unverified_checks. Never return pass with required validation missing.
 - Prefer targeted checks: `cargo check -p <touched-crate> --all-targets` or `cargo test -p <touched-crate> --test <relevant-test>`.
 - Prefer small, decisive fixes over exploratory loops. If time expires before all requirements can be verified, submit a blocked wheel_result with the unresolved findings.
 
 Do NOT change Hamstik Work Item status/comments and do NOT create a Git commit. Hamstik Wheel owns those actions.
 
-Your final tool action MUST call wheel_result with status pass or blocked, a concrete independent-review summary, findings, and unverified_checks. Both arrays must be present. Return pass only with zero unresolved findings and zero unverified required checks. Do not merely print a marker or verdict in prose. No editing or checks are possible after submission.
+Your final tool action MUST call wheel_result with status pass or blocked, a concrete independent-review summary, findings, unverified_checks, and pending_scheduled_checks. All arrays must be present. Return pass only with zero unresolved findings and zero unverified required checks. Do not declare arbitrary commands pending: only exact commands in the supplied validation configuration that apply to changed paths are allowed, including configured wrapper commands that invoke the required checks. Do not merely print a marker or verdict in prose. No editing or checks are possible after submission.
 "#,
         serde_json::to_string_pretty(context).unwrap_or_else(|_| context.to_string())
     )
@@ -655,6 +665,17 @@ mod tests {
         let result = parse_agent_result(output).unwrap();
         assert_eq!(result.status, "pass");
         assert!(result.findings.is_empty());
+    }
+
+    #[test]
+    fn parses_structured_pending_scheduled_checks() {
+        let output = r#"HAMSTIK_WHEEL_RESULT={"status":"ready_for_review","summary":"implemented","findings":[],"unverified_checks":[],"pending_scheduled_checks":[{"command":"pnpm migrations:test"}]}"#;
+        let result = parse_agent_result(output).unwrap();
+        assert_eq!(result.pending_scheduled_checks.len(), 1);
+        assert_eq!(
+            result.pending_scheduled_checks[0].command,
+            "pnpm migrations:test"
+        );
     }
 
     #[test]

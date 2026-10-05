@@ -179,7 +179,7 @@ Today Hamstik Wheel provides:
   with an optional `--log-file <PATH>` mirror of the whole run;
 - `--max-items`, `max_review_cycles`, and the unattended-resilience options
   (`on_failure`, `agent_timeout_minutes`, `implement_retry`);
-- `init`, `doctor`, `once`, `run`, `resume`, `status`, and `progress-report`;
+- `init`, `doctor`, `once`, `run`, `resume`, `reset-failures`, `status`, and `progress-report`;
 - `--timestamps` and `--log-file` output logging options.
 
 Release packaging, a `docs/` tree, and multi-agent scale-out are future work;
@@ -194,7 +194,8 @@ concurrency beyond one Work Item is a non-goal by design.
 | `hamstik-wheel once` | Process exactly one Work Item, resuming an active item first when needed |
 | `hamstik-wheel run --max-items N` | Process Work Items sequentially until the requested/configured limit or no work remains |
 | `hamstik-wheel resume` | Resume the interrupted active Work Item; errors when nothing is active |
-| `hamstik-wheel status` | Show persisted loop state: phase, Work Item, baseline SHA, review cycle, last error, skip ledger |
+| `hamstik-wheel reset-failures` | Acknowledge repaired queue-wide failures and reset the consecutive-skip circuit breaker; preserves the skip ledger and WIP; refuses while work is active |
+| `hamstik-wheel status` | Show persisted loop state: phase, Work Item, baseline SHA, review cycle, failure streak/threshold, last error, skip ledger |
 | `hamstik-wheel progress-report` | Summarize the latest recorded progress for each Work Item from this repository's local logs and checkpoints |
 
 `run` and `once` automatically resume an active Work Item before selecting a
@@ -416,6 +417,14 @@ it is explicitly scheduled in Wheel's validation configuration. Wheel does
 not infer required checks by parsing repository prose or agent summaries;
 configure critical checks as commands/rules for a deterministic gate.
 
+An agent may declare an exact configured command as a structured
+`pending_scheduled_checks` entry when it applies to the changed paths. Wheel
+rejects entries that are not exact resolved commands, runs accepted checks
+before review, and includes them again in final validation. These are distinct
+from `unverified_checks`; arbitrary text cannot defer a required check. An
+exact configured wrapper command may be declared when that wrapper runs the
+required checks.
+
 ## Agent isolation and host validation
 
 Agent execution now requires Linux, Bubblewrap at `/usr/bin/bwrap`, and Node.js
@@ -437,14 +446,27 @@ sensitive files, and protected metadata. Their actual I/O runs inside the same
 mount isolation as shell commands, so a concurrent path change cannot redirect
 I/O onto the host. Shell tools have:
 
-- A writable repository, read-only Git metadata/configuration/dependencies, and
-  read-only system executables/libraries. External hardlinks in the writable
+- A writable repository, read-only Git metadata/configuration, and
+  read-only system executables/libraries. Dependencies under `node_modules` use
+  temporary copy-on-write overlays: tools can create caches or edit their private
+  copy, but host packages stay unchanged and changes disappear after each command.
+  Existing `.next` and `.astro` directories are private empty build caches;
+  build and serve/test within one command when tests need the build output. External hardlinks in the writable
   source tree are masked; they cannot expose or modify the external inode.
-  Dependency/toolchain mounts are explicitly trusted read-only inputs.
+  Dependency/toolchain mounts are explicitly trusted inputs.
 - Private `/tmp`, HOME, process and network namespaces; no inherited environment
   credentials, host home directory, or standard Docker/Podman sockets.
 - Masked `.env` variants, private-key files, and credential directories within
-  the repository. Wheel's private metadata is hidden from agent tools.
+  the repository. Example environment templates (`.env.example`, `.env.sample`,
+  `.env.template`, including named variants) and source modules such as
+  `secrets.ts`, `secrets.test.ts`, and `Secrets.js` remain readable. Do not store
+  actual credentials in source modules. Wheel's private metadata is hidden.
+- Repository sockets, FIFOs and devices are masked rather than exposed. A
+  leftover socket cannot reach host IPC or lock out unrelated tools. Direct file
+  tools still reject special files. Keep test databases and sockets in private
+  `/tmp`, running the server and its tests within one shell command.
+- Read-only `/etc/passwd`, `/etc/group`, and `/etc/hosts` support local identity
+  lookup and loopback names; shadow files and other host configuration remain hidden.
 - A bounded shell lifetime (five minutes by default, at most thirty minutes).
   Namespace teardown removes background children when a tool ends. Wheel also
   kills Pi's process group at session exit/timeout; on Linux Pi is tied to
@@ -464,7 +486,8 @@ This includes agent-edited precheck scripts, package scripts, and test code;
 otherwise an agent could bypass its tool restrictions by editing a test. Each
 validation command has a thirty-minute deadline and managed process cleanup.
 Credentials and host services remain unavailable, and required checks that cannot
-run block completion. Prepare dependencies/toolchains before starting a run.
+run block completion. Prepare dependencies/toolchains before starting a run. Bubblewrap must support
+`--overlay-src` and `--tmp-overlay`; unsupported hosts fail during sandbox preflight.
 
 An explicit `[validation] execution = "trusted_host"` opts out for validation
 only. Wheel warns on every run. This executes agent-modified repository code with
@@ -474,6 +497,11 @@ disposable databases, never shared or production resources. Do not enable it
 merely to silence a sandbox failure. Agent tools remain isolated in either mode.
 A required integration check must be configured for Wheel or explicitly reported
 as unverified; no automatic host fallback occurs.
+
+Optional `validation.preflight_commands` run in that same execution mode before
+Wheel claims work. Use short environment smoke checks (for example, confirming
+a sandboxed tool starts), not substitute test suites or checks requiring
+credentials.
 
 The sandbox is a tool boundary, not an isolation wrapper around the Pi runtime.
 Pi still needs its provider credentials and provider network connection. Wheel
@@ -620,6 +648,11 @@ status recorded immediately before claiming it. Wheel reads the actual status
 before claiming; it does not assume `todo` or rely on a stale candidate list.
 That key is excluded for the rest of the run, so Wheel can
 select the next candidate. `max_items` counts completed plus skipped items.
+`max_consecutive_skips` (default 3) opens a durable circuit breaker after a
+run of failed items, stopping further selection until an operator intervenes;
+a successful completion resets the counter. After repairing a queue-wide
+failure, run `hamstik-wheel reset-failures` before `once` or `run`; it preserves
+the skip ledger and WIP branches and refuses while an item remains active.
 
 Across invocations, skipped items have a 30-minute cooldown. Changing the
 model named in a failure bypasses its cooldown; failures without a known

@@ -38,6 +38,10 @@ pub struct ActiveWorkItem {
     pub commit_sha: Option<String>,
     #[serde(default)]
     pub validation_command_count: usize,
+    /// Commands the implementation agent explicitly deferred to Wheel's
+    /// configured validation gates. They remain durable across resume.
+    #[serde(default)]
+    pub pending_scheduled_checks: Vec<String>,
     /// Saved before the first claim. None on checkpoints from older versions.
     #[serde(default)]
     pub previous_status: Option<String>,
@@ -70,6 +74,10 @@ pub struct WheelState {
     /// failures (same item, same model, same failure kind).
     #[serde(default)]
     pub skip_ledger: Vec<SkipRecord>,
+    /// Consecutive completed skips across invocations. A successful item
+    /// resets this so a deterministic failure queue cannot run unattended.
+    #[serde(default)]
+    pub consecutive_skips: usize,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -123,6 +131,7 @@ impl Default for WheelState {
             completed_this_run: 0,
             last_error: None,
             skip_ledger: Vec::new(),
+            consecutive_skips: 0,
             updated_at: Utc::now(),
         }
     }
@@ -202,6 +211,14 @@ impl StateStore {
         state.review_cycle = 0;
         state.last_error = Some(format!("{}: {}", record.key, record.reason));
         state.record_skip(record);
+        state.consecutive_skips = state.consecutive_skips.saturating_add(1);
+        self.save(state)
+    }
+
+    /// A completed item proves the run is making progress, so re-arm the
+    /// consecutive-skip circuit breaker.
+    pub fn reset_consecutive_skips(&self, state: &mut WheelState) -> Result<()> {
+        state.consecutive_skips = 0;
         self.save(state)
     }
 
@@ -225,6 +242,7 @@ mod tests {
             baseline_sha: "abc".to_string(),
             commit_sha: None,
             validation_command_count: 0,
+            pending_scheduled_checks: Vec::new(),
             previous_status: None,
             claim_attempted: false,
             claim_confirmed: false,
@@ -348,6 +366,9 @@ mod tests {
         assert_eq!(state.phase, Phase::Idle);
         assert!(state.current.is_none());
         assert_eq!(state.skip_ledger.len(), 1);
+        assert_eq!(state.consecutive_skips, 1);
+        store.reset_consecutive_skips(&mut state).unwrap();
+        assert_eq!(state.consecutive_skips, 0);
         let loaded = store.load().unwrap();
         assert_eq!(
             loaded.last_skip("HAM-3").unwrap().reason,

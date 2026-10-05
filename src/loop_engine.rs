@@ -275,6 +275,10 @@ impl LoopEngine {
         self.logger
             .info(&format!("Logs: {}", self.logs_root.display()));
         self.logger.info(&format!("Phase: {:?}", state.phase));
+        self.logger.info(&format!(
+            "Consecutive skipped failures: {} / {}",
+            state.consecutive_skips, self.config.r#loop.max_consecutive_skips
+        ));
         if let Some(item) = state.current.as_ref() {
             self.logger
                 .info(&format!("Work Item: {} — {}", item.key, item.title));
@@ -319,6 +323,23 @@ impl LoopEngine {
         Ok(())
     }
 
+    /// Explicit operator acknowledgement after repairing an environment or
+    /// queue-wide failure. This intentionally preserves skip history and WIP.
+    pub fn reset_failures(&self) -> Result<()> {
+        let mut state = self.store.load()?;
+        if state.current.is_some() {
+            bail!(
+                "cannot reset consecutive failures while a Work Item is active; run `hamstik-wheel resume` to finish or clean up that item first"
+            );
+        }
+        let previous = state.consecutive_skips;
+        self.store.reset_consecutive_skips(&mut state)?;
+        self.logger.info(&format!(
+            "Reset consecutive skipped failures from {previous} to 0; skip ledger and preserved WIP remain unchanged."
+        ));
+        Ok(())
+    }
+
     pub fn run(&self, max_items: Option<usize>) -> Result<()> {
         let limit = max_items.unwrap_or(self.config.r#loop.max_items);
         if limit == 0 {
@@ -340,6 +361,9 @@ impl LoopEngine {
         if let Some(key) = recovered {
             excluded.insert(key);
         }
+        if self.store.load()?.current.is_none() && self.consecutive_skip_circuit_open()? {
+            return Ok(());
+        }
         while completed + skipped < limit {
             match self.process_one(&mut excluded)? {
                 ProcessOutcome::Completed => {
@@ -360,6 +384,9 @@ impl LoopEngine {
                         "Skipped {skipped}/{limit} Work Item(s) after failure; continuing (on_failure = skip)."
                     ));
                     self.logger.blank();
+                    if self.consecutive_skip_circuit_open()? {
+                        break;
+                    }
                 }
                 ProcessOutcome::NoWork => {
                     self.logger.info("No eligible Hamstik Work Items found.");
@@ -376,6 +403,9 @@ impl LoopEngine {
 
     pub fn once(&self) -> Result<()> {
         if self.recover_pending_cleanup()?.is_some() {
+            return Ok(());
+        }
+        if self.store.load()?.current.is_none() && self.consecutive_skip_circuit_open()? {
             return Ok(());
         }
         self.preflight_for_work()?;
@@ -403,6 +433,19 @@ impl LoopEngine {
         }
         if self.config.validation.commands.is_empty() {
             bail!("configure at least one base validation command before running; review alone is not a completion gate");
+        }
+        if !self.config.validation.preflight_commands.is_empty() {
+            self.logger.info("[preflight] validation sandbox checks");
+            let report = run_all(
+                self.repo.root(),
+                &self.config.validation.preflight_commands,
+                &self.logger,
+                ValidationKind::Inspection,
+                self.validation_sandbox(),
+            )?;
+            if !report.passed {
+                bail!("configured validation preflight command failed; fix the validation environment before Wheel claims work");
+            }
         }
         require_process("pi", &["--version"])?;
         require_process(&self.config.hamstik.cli_path, &["--version"])?;
@@ -588,6 +631,7 @@ impl LoopEngine {
                 baseline_sha: baseline,
                 commit_sha: None,
                 validation_command_count: 0,
+                pending_scheduled_checks: Vec::new(),
                 previous_status: None,
                 claim_attempted: false,
                 claim_confirmed: false,
@@ -995,11 +1039,15 @@ impl LoopEngine {
                     result.unverified_checks.join("; ")
                 );
             }
+            let commands = self.validation_commands(&current.baseline_sha)?;
+            let pending_scheduled_checks =
+                self.pending_scheduled_checks(&result.pending_scheduled_checks, &commands)?;
             match result.status.as_str() {
                 "ready_for_review" => {}
                 "blocked" => bail!("implementation blocked: {}", result.summary),
                 other => bail!("unexpected implementation result status: {other}"),
             }
+            state.current.as_mut().unwrap().pending_scheduled_checks = pending_scheduled_checks;
             state.phase = Phase::PreReviewValidation;
             self.store.save(state)?;
         }
@@ -1017,7 +1065,8 @@ impl LoopEngine {
                 );
                 self.logger.blank();
                 self.logger.info("[inspect] pre-review checks");
-                let commands = self.validation_commands(&current.baseline_sha)?;
+                let commands =
+                    self.validation_commands_with_pending(&current.baseline_sha, state)?;
                 let report = run_all(
                     self.repo.root(),
                     &commands,
@@ -1090,6 +1139,16 @@ impl LoopEngine {
                         review.unverified_checks.join("; ")
                     );
                 }
+                let commands = self.validation_commands(&current.baseline_sha)?;
+                let pending_scheduled_checks =
+                    self.pending_scheduled_checks(&review.pending_scheduled_checks, &commands)?;
+                let active = state.current.as_mut().unwrap();
+                for command in pending_scheduled_checks {
+                    if !active.pending_scheduled_checks.contains(&command) {
+                        active.pending_scheduled_checks.push(command);
+                    }
+                }
+                self.store.save(state)?;
                 if review.status == "blocked" {
                     bail!("review blocked: {}", review.summary);
                 }
@@ -1136,7 +1195,8 @@ impl LoopEngine {
                 self.logger.blank();
                 self.logger
                     .info(&format!("[validate] final checks for cycle {cycle}"));
-                let commands = self.validation_commands(&current.baseline_sha)?;
+                let commands =
+                    self.validation_commands_with_pending(&current.baseline_sha, state)?;
                 let final_report = run_all(
                     self.repo.root(),
                     &commands,
@@ -1275,6 +1335,7 @@ impl LoopEngine {
             );
 
             state.completed_this_run += 1;
+            self.store.reset_consecutive_skips(state)?;
             // The item completed; its skip history is no longer relevant.
             if let Some(active_key) = state.current.as_ref().map(|item| item.key.clone()) {
                 state.clear_skip(&active_key);
@@ -1307,10 +1368,62 @@ impl LoopEngine {
         }
     }
 
+    fn consecutive_skip_circuit_open(&self) -> Result<bool> {
+        let consecutive = self.store.load()?.consecutive_skips;
+        let limit = self.config.r#loop.max_consecutive_skips;
+        if consecutive < limit {
+            return Ok(false);
+        }
+        self.logger.warn(&format!(
+            "[circuit-breaker] stopped after {consecutive} consecutive skipped Work Items (limit {limit}); inspect the skip ledger before resuming."
+        ));
+        Ok(true)
+    }
+
     fn validation_commands(&self, baseline: &str) -> Result<Vec<String>> {
         let paths = self.repo.changed_paths(baseline)?;
         self.config.validation.require_coverage(&paths)?;
         Ok(self.config.validation.commands_for_paths(&paths))
+    }
+
+    fn validation_commands_with_pending(
+        &self,
+        baseline: &str,
+        state: &WheelState,
+    ) -> Result<Vec<String>> {
+        let mut commands = self.validation_commands(baseline)?;
+        for command in state
+            .current
+            .as_ref()
+            .map(|item| &item.pending_scheduled_checks)
+            .into_iter()
+            .flatten()
+        {
+            if !commands.contains(command) {
+                commands.push(command.clone());
+            }
+        }
+        Ok(commands)
+    }
+
+    fn pending_scheduled_checks(
+        &self,
+        pending: &[crate::pi::PendingScheduledCheck],
+        resolved_commands: &[String],
+    ) -> Result<Vec<String>> {
+        let mut commands = Vec::new();
+        for check in pending {
+            if check.command.trim().is_empty() || !resolved_commands.contains(&check.command) {
+                bail!(
+                    "implementation declared scheduled check `{}` that is not an exact configured command for the changed paths",
+                    check.command
+                );
+            }
+            if !commands.contains(&check.command) {
+                commands.push(check.command.clone());
+            }
+        }
+        Ok(commands)
     }
 
     fn log_path(&self, key: &str, name: &str) -> PathBuf {

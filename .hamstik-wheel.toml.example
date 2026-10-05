@@ -36,6 +36,9 @@ read_only_paths = []
 # Sandboxed by default, including agent-edited scripts. At least one base command
 # is required. Every command must pass. No host network, sockets or credentials.
 execution = "sandbox"
+# Optional lightweight commands that prove the validation sandbox can start
+# before Wheel claims work. They are environment smoke checks, not test gates.
+preflight_commands = []
 # Opting into execution = "trusted_host" gives edited tests/scripts full host
 # access. Use ONLY inside an already disposable trusted VM/container, with
 # disposable test resources. Never enable this just to bypass isolation failures.
@@ -60,6 +63,9 @@ max_review_cycles = 3
 # Provider outages preserve the active checkpoint and stop after bounded retries
 # in either mode, so `resume` can continue the same phase.
 on_failure = "halt"
+# Stop an unattended run after this many completed item skips. The counter is
+# durable across resume and resets after a successful Work Item.
+max_consecutive_skips = 3
 # Wall-clock cap for each agent session, in minutes. 0 disables the cap.
 agent_timeout_minutes = 105
 # Retry the implementation session once when the first attempt fails to

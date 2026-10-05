@@ -54,7 +54,7 @@ test('all file operations stay in the repository, including symlinks and hardlin
   assert.equal(fs.readFileSync(outside, 'utf8'), 'original');
   const leaked = await shell(config, 'cat hardlink');
   assert.ok(!leaked.output.includes('original'));
-  await assert.rejects(fileOperation(config, 'readFile', path.join(root, 'hardlink')));
+  assert.equal((await fileOperation(config, 'readFile', path.join(root, 'hardlink'))).length, 0);
 });
 
 test('secret files and host credentials are unavailable, Git metadata cannot be changed', async t => {
@@ -94,12 +94,15 @@ test('background shell processes cannot write after the tool returns', async t =
   assert.equal(fs.existsSync(path.join(root, 'delayed')), false);
 });
 
-test('sandbox refuses repository sockets rather than exposing host IPC', async t => {
+test('repository sockets are masked without locking out unrelated tools', async t => {
   const { root, config } = fixture(t);
   const server = net.createServer();
   await new Promise(resolve => server.listen(path.join(root, 'host.sock'), resolve));
   t.after(() => server.close());
-  assert.throws(() => checkSandbox(config), /sockets/);
+  checkSandbox(config);
+  assert.throws(() => guardPath(root, 'host.sock'));
+  assert.equal((await shell(config, 'echo usable > recovery.txt')).exitCode, 0);
+  assert.notEqual((await shell(config, `node -e "require('net').connect('host.sock').on('error',()=>process.exit(1))"`)).exitCode, 0);
 });
 
 test('internal hardlinks do not produce thousands of bind mounts', t => {
@@ -119,7 +122,7 @@ test('large shell output stays bounded without host spill files', async t => {
   assert.deepEqual(new Set(fs.readdirSync(os.tmpdir()).filter(p => p.startsWith('pi-bash-'))), before);
 });
 
-test('read-only toolchains hide credentials and reject IPC sockets', async t => {
+test('read-only toolchains hide credentials and mask IPC sockets', async t => {
   const { parent, root, config } = fixture(t);
   const toolchain = path.join(parent, 'toolchain'); fs.mkdirSync(toolchain);
   fs.writeFileSync(path.join(toolchain, 'credentials.toml'), 'private-key');
@@ -129,6 +132,66 @@ test('read-only toolchains hide credentials and reject IPC sockets', async t => 
   const server = net.createServer();
   await new Promise(resolve => server.listen(path.join(toolchain, 'daemon.sock'), resolve));
   t.after(() => server.close());
-  assert.throws(() => checkSandbox(config), /sockets/);
+  checkSandbox(config);
+  assert.notEqual((await shell(config, `node -e "require('net').connect('${toolchain}/daemon.sock').on('error',()=>process.exit(1))"`)).exitCode, 0);
   assert.throws(() => checkSandbox({root, readOnlyPaths: [os.homedir()]}), /toolchain/);
+});
+
+
+test('source modules and templates remain readable while credentials stay masked', async t => {
+  const { root, config } = fixture(t);
+  for (const name of ['secrets.ts', 'secrets.test.ts', 'Secrets.js', 'Secrets.js.map', 'secrets.d.ts.map', 'credentials.py', '.env.example']) {
+    fs.writeFileSync(path.join(root, name), 'public-source');
+    assert.equal((await fileOperation(config, 'readFile', path.join(root, name))).toString(), 'public-source');
+  }
+  for (const name of ['secrets.json', 'credentials.toml', '.env.local', 'private.key', '.env.example.local']) {
+    fs.writeFileSync(path.join(root, name), 'private-value');
+    assert.throws(() => guardPath(root, name));
+    assert.ok(!(await shell(config, `cat '${name}'`)).output.includes('private-value'));
+  }
+});
+
+test('dependency writes and caches are ephemeral; credentials and host hardlinks stay protected', async t => {
+  const { root, parent, config } = fixture(t);
+  const modules = path.join(root, 'node_modules'); fs.mkdirSync(modules);
+  const outside = path.join(parent, 'dependency-outside'); fs.writeFileSync(outside, 'host-original');
+  fs.linkSync(outside, path.join(modules, 'linked.js'));
+  fs.writeFileSync(path.join(modules, 'Secrets.js'), 'export default 1');
+  fs.writeFileSync(path.join(modules, 'credentials.json'), 'private-value');
+  const result = await shell(config, 'mkdir -p node_modules/.vite-temp && echo cached > node_modules/.vite-temp/config.mjs && echo edited > node_modules/linked.js && cat node_modules/Secrets.js');
+  assert.equal(result.exitCode, 0, result.output);
+  assert.ok(result.output.includes('export default 1'));
+  assert.equal(fs.readFileSync(outside, 'utf8'), 'host-original');
+  assert.equal(fs.existsSync(path.join(modules, '.vite-temp')), false);
+  assert.equal((await shell(config, 'test ! -e node_modules/.vite-temp/config.mjs')).exitCode, 0);
+  assert.ok(!(await shell(config, 'cat node_modules/credentials.json')).output.includes('private-value'));
+});
+
+test('system identity lookup works without exposing shadow or host configuration', async t => {
+  const { config } = fixture(t);
+  const result = await shell(config, 'id -un && test ! -e /etc/shadow && test ! -e /etc/shadow-');
+  assert.equal(result.exitCode, 0, result.output);
+});
+
+
+test('build caches hide old env copies and allow clean builds without host writes', async t => {
+  const { root, config } = fixture(t);
+  fs.mkdirSync(path.join(root, '.next', 'standalone'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.next', 'standalone', '.env'), 'private-build-value');
+  const result = await shell(config, 'rm -rf .next/standalone && mkdir -p .next/standalone && echo fresh > .next/standalone/output');
+  assert.equal(result.exitCode, 0, result.output);
+  assert.equal(fs.readFileSync(path.join(root, '.next', 'standalone', '.env'), 'utf8'), 'private-build-value');
+  assert.equal(fs.existsSync(path.join(root, '.next', 'standalone', 'output')), false);
+  assert.ok(!(await shell(config, 'cat .next/standalone/.env')).output.includes('private-build-value'));
+});
+
+
+test('multiple masked credentials are empty regular files for dotenv and file APIs', async t => {
+  const { root, config } = fixture(t);
+  fs.writeFileSync(path.join(root, '.env'), 'WHEEL_PRIVATE_VALUE=host-secret');
+  fs.writeFileSync(path.join(root, '.env.local'), 'WHEEL_PRIVATE_VALUE=other-host-secret');
+  checkSandbox(config);
+  const result = await shell(config, `node -e "const fs=require('fs');for(const p of ['.env','.env.local']){if(!fs.statSync(p).isFile())process.exit(2);if(fs.readFileSync(p).length)process.exit(3);process.loadEnvFile(p);}if(process.env.WHEEL_PRIVATE_VALUE)process.exit(4)"`);
+  assert.equal(result.exitCode, 0, result.output);
+  assert.equal(fs.readFileSync(path.join(root, '.env'), 'utf8'), 'WHEEL_PRIVATE_VALUE=host-secret');
 });

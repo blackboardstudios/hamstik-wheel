@@ -239,6 +239,10 @@ if [ "$model" = 'implement' ]; then
     echo '{"type":"wheel_result","result":{"findings":["blocked"],"unverified_checks":[],"status":"blocked","summary":"item blocked"}}'
   elif [ "$TEST_MODE" = 'unverified' ]; then
     echo '{"type":"wheel_result","result":{"findings":[],"unverified_checks":["populated migration test"],"status":"ready_for_review","summary":"implemented"}}'
+  elif [ "$TEST_MODE" = 'scheduled-pending' ]; then
+    echo '{"type":"wheel_result","result":{"findings":[],"unverified_checks":[],"pending_scheduled_checks":[{"command":"sh -c '\''echo scheduled >> .git/scheduled-checks'\''"}],"status":"ready_for_review","summary":"implemented"}}'
+  elif [ "$TEST_MODE" = 'scheduled-invalid' ]; then
+    echo '{"type":"wheel_result","result":{"findings":[],"unverified_checks":[],"pending_scheduled_checks":[{"command":"arbitrary bypass"}],"status":"ready_for_review","summary":"implemented"}}'
   else
     echo '{"type":"wheel_result","result":{"findings":[],"unverified_checks":[],"status":"ready_for_review","summary":"implemented"}}'
   fi
@@ -254,6 +258,10 @@ else
     echo 'No marker'
   elif [ "$TEST_MODE" = 'unverified-review' ]; then
     echo '{"type":"wheel_result","result":{"findings":[],"unverified_checks":["populated migration test"],"status":"pass","summary":"reviewed"}}'
+  elif [ "$TEST_MODE" = 'review-scheduled-invalid' ]; then
+    echo '{"type":"wheel_result","result":{"findings":[],"unverified_checks":[],"pending_scheduled_checks":[{"command":"arbitrary review bypass"}],"status":"pass","summary":"reviewed"}}'
+  elif [ "$TEST_MODE" = 'review-pending-unverified' ]; then
+    echo '{"type":"wheel_result","result":{"findings":[],"unverified_checks":["missing required check"],"pending_scheduled_checks":[{"command":"true"}],"status":"pass","summary":"reviewed"}}'
   else
     echo '{"type":"wheel_result","result":{"findings":[],"unverified_checks":[],"status":"pass","summary":"reviewed"}}'
   fi
@@ -270,6 +278,40 @@ fn preflight_fails_when_model_probe_reports_non_retryable_provider_error() {
     assert!(stderr.contains("404: vendor/model:batch cannot be used"));
     assert!(!f.root().join(".git/sessions").exists());
     assert!(!f.root().join(".git/starts").exists());
+}
+
+#[test]
+fn validation_preflight_failure_stops_before_claim_or_model_and_also_blocks_resume() {
+    let f = Fixture::new();
+    let config = f.read(".hamstik-wheel.toml").replace(
+        "commands = [\"true\"]",
+        "preflight_commands = [\"false\"]\ncommands = [\"true\"]",
+    );
+    f.write(".hamstik-wheel.toml", &config);
+    assert!(!f.run(&["once"], "success").status.success());
+    assert!(!f.root().join(".git/sessions").exists());
+    assert!(!f.root().join(".git/starts").exists());
+    assert!(!f.root().join(".git/hamstik-commands").exists());
+
+    f.set_state(&json!({
+        "schemaVersion": 1,
+        "phase": "selected",
+        "current": {
+            "key": "TEST-1",
+            "title": "First",
+            "baselineSha": f.git(&["rev-parse", "HEAD"]),
+            "needsReclaim": true
+        },
+        "reviewCycle": 0,
+        "completedThisRun": 0,
+        "lastError": null,
+        "skipLedger": [],
+        "updatedAt": "2026-01-01T00:00:00Z"
+    }));
+    assert!(!f.run(&["resume"], "success").status.success());
+    assert!(!f.root().join(".git/sessions").exists());
+    assert!(!f.root().join(".git/starts").exists());
+    assert!(!f.root().join(".git/hamstik-commands").exists());
 }
 
 #[test]
@@ -430,6 +472,78 @@ fn unverified_checks_prevent_completion_even_with_success_markers() {
         assert!(!f.root().join(".git/closes").exists());
         assert_eq!(f.state()["completedThisRun"], 0);
     }
+}
+
+#[test]
+fn scheduled_checks_are_not_unverified_and_run_at_both_validation_gates() {
+    let f = Fixture::new();
+    let config = f.read(".hamstik-wheel.toml")
+        + r#"
+[[validation.rules]]
+path_prefixes = ["TEST-"]
+commands = ["sh -c 'echo scheduled >> .git/scheduled-checks'"]
+"#;
+    f.write(".hamstik-wheel.toml", &config);
+    f.git(&["add", "-A"]);
+    f.git(&["commit", "-qm", "scheduled validation rule"]);
+    assert!(f.run(&["once"], "scheduled-pending").status.success());
+    assert_eq!(f.read(".git/scheduled-checks").lines().count(), 2);
+    assert!(f.root().join(".git/closes").exists());
+}
+
+#[test]
+fn arbitrary_pending_scheduled_check_cannot_bypass_validation() {
+    let f = Fixture::new();
+    assert!(f.run(&["once"], "scheduled-invalid").status.success());
+    assert!(!f.root().join(".git/closes").exists());
+    assert_eq!(f.state()["completedThisRun"], 0);
+}
+
+#[test]
+fn reviewer_pending_or_unverified_checks_cannot_bypass_final_validation() {
+    for mode in ["review-scheduled-invalid", "review-pending-unverified"] {
+        let f = Fixture::new();
+        assert!(f.run(&["once"], mode).status.success());
+        assert!(!f.root().join(".git/closes").exists());
+        assert_eq!(f.state()["completedThisRun"], 0);
+    }
+}
+
+#[test]
+fn consecutive_skip_circuit_breaker_stops_before_the_next_item() {
+    let f = Fixture::new();
+    let config = f.read(".hamstik-wheel.toml").replace(
+        "max_review_cycles = 1",
+        "max_review_cycles = 1\nmax_consecutive_skips = 1",
+    );
+    f.write(".hamstik-wheel.toml", &config);
+    f.git(&["add", "-A"]);
+    f.git(&["commit", "-qm", "circuit breaker"]);
+    let output = f.run(&["run", "--max-items", "2"], "skip");
+    assert!(output.status.success());
+    assert_eq!(f.read(".git/sessions").lines().count(), 1);
+    assert!(!f.root().join(".git/closes").exists());
+    assert_eq!(f.state()["consecutiveSkips"], 1);
+    assert!(f.run(&["once"], "skip").status.success());
+    assert_eq!(f.read(".git/sessions").lines().count(), 1);
+    let status = f.run(&["--no-timestamps", "status"], "success");
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains("Consecutive skipped failures: 1 / 1"));
+    assert!(f.run(&["reset-failures"], "success").status.success());
+    assert_eq!(f.state()["consecutiveSkips"], 0);
+    assert_eq!(f.state()["skipLedger"].as_array().unwrap().len(), 1);
+    assert!(f.run(&["once"], "success").status.success());
+    assert_eq!(f.read(".git/closes"), "TEST-2\n");
+}
+
+#[test]
+fn reset_failures_refuses_to_mask_an_active_work_item() {
+    let f = Fixture::new();
+    assert!(!f.run(&["once"], "rate-limit").status.success());
+    let output = f.run(&["reset-failures"], "success");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("while a Work Item is active"));
+    assert!(f.state()["current"].is_object());
 }
 
 #[test]

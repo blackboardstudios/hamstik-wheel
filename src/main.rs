@@ -83,6 +83,8 @@ enum Commands {
     },
     /// Resume an interrupted active Work Item.
     Resume,
+    /// Acknowledge repaired failures and re-arm unattended Work Item selection.
+    ResetFailures,
     /// Show persisted orchestration state.
     Status,
     /// Summarize the latest recorded progress for each Work Item from local logs.
@@ -118,6 +120,7 @@ fn run() -> Result<()> {
         Commands::Once => LoopEngine::load_with_logger(&logger)?.once(),
         Commands::Run { max_items } => LoopEngine::load_with_logger(&logger)?.run(max_items),
         Commands::Resume => LoopEngine::load_with_logger(&logger)?.resume(),
+        Commands::ResetFailures => LoopEngine::load_with_logger(&logger)?.reset_failures(),
         Commands::Status => LoopEngine::load_with_logger(&logger)?.status(),
         Commands::ProgressReport => progress::report(&GitRepo::discover()?, &logger),
     }
